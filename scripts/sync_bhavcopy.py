@@ -23,7 +23,7 @@ def get_nse_session():
     return session
 
 def fetch_bhavcopy_deltas(session):
-    today = datetime.date.today()
+    today = datetime.date(2026, 9, 11)
     date_str = today.strftime("%d%m%Y")
     
     # Modern NSE consolidated Bhavcopy endpoint
