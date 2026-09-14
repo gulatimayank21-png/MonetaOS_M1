@@ -1,0 +1,6 @@
+{
+  "name": "Moneta OS",
+  "description": "Personal wealth and systematic quantitative investing OS for Indian equity markets. Multi-timeframe momentum, relative strength screeners, sector tailwinds, and portfolio risk models.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

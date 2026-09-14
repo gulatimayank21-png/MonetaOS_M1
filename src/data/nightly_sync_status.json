@@ -1,0 +1,24 @@
+{
+  "lastSuccessfulSync": "2026-09-12T12:58:32.600Z",
+  "lastAttempt": "2026-09-12T12:58:32.600Z",
+  "status": "success",
+  "errorMessage": null,
+  "scheduledCron": "Daily at 00:00 IST",
+  "source": "Official NSE India Archives",
+  "updatedIndices": [
+    "nifty500",
+    "nifty50",
+    "niftynext50",
+    "niftymidcap150",
+    "niftysmallcap250"
+  ],
+  "stockCounts": {
+    "nifty500": 501,
+    "nifty50": 50,
+    "niftynext50": 50,
+    "niftymidcap150": 150,
+    "niftysmallcap250": 250
+  },
+  "lastActualNSESync": "2026-09-12T12:58:32.600Z",
+  "syncMode": "live_nse_direct"
+}
