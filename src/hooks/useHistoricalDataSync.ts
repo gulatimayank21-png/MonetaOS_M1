@@ -15,6 +15,7 @@ import type {
   CheckCacheResponse,
   WarmupCompleteResponse,
   BacktestCompleteResponse,
+  SyncDeltasResultResponse,
   ErrorResponse,
   DbStatusData,
 } from '../workers/dbWorker';
@@ -25,6 +26,7 @@ import {
   STORAGE_VERSION_KEY,
   DB_FILENAME,
 } from '../constants/database';
+import { DeltaSyncResult } from '../utils/deltaSyncService';
 
 export type SyncStatus = 'idle' | 'checking' | 'downloading' | 'ready' | 'error';
 
@@ -34,8 +36,10 @@ export interface UseHistoricalDataSyncReturn {
   progressMessage: string;
   error: string | null;
   dbStats: DbStatusData | null;
+  deltaSync: DeltaSyncResult | null;
   hasCachedData: boolean;
   startWarmup: (forceDownload?: boolean) => void;
+  syncDeltas: () => Promise<DeltaSyncResult>;
   runQuery: <T = any>(sql: string, params?: any[]) => Promise<T[]>;
   runRealBacktest: (config: BacktestConfig) => Promise<{ summary: BacktestSummary; executionTimeMs: number }>;
   checkCache: () => void;
@@ -47,6 +51,7 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
   const [progressMessage, setProgressMessage] = useState<string>('Initializing SQLite engine...');
   const [error, setError] = useState<string | null>(null);
   const [dbStats, setDbStats] = useState<DbStatusData | null>(null);
+  const [deltaSync, setDeltaSync] = useState<DeltaSyncResult | null>(null);
   const [hasCachedData, setHasCachedData] = useState<boolean>(false);
 
   const workerRef = useRef<Worker | null>(null);
@@ -171,10 +176,16 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
         case 'WARMUP_COMPLETE': {
           const res = response as WarmupCompleteResponse;
           setDbStats(res.status);
+          if (res.deltaSync) {
+            setDeltaSync(res.deltaSync);
+          }
           setStatus('ready');
           setProgress(100);
+          const syncNote = res.deltaSync && res.deltaSync.syncedCount > 0
+            ? ` • Synced ${res.deltaSync.syncedCount} new candles (${res.deltaSync.maxDate})`
+            : '';
           setProgressMessage(
-            `Database ${APP_DB_VERSION} loaded successfully (${res.status.totalCandles.toLocaleString()} rows, ${res.status.uniqueSymbols} symbols)`
+            `Database ${APP_DB_VERSION} loaded successfully (${res.status.totalCandles.toLocaleString()} rows, ${res.status.uniqueSymbols} symbols${syncNote})`
           );
           setError(null);
           setHasCachedData(true);
@@ -188,6 +199,17 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
 
           if (pending) {
             pending.resolve(res);
+            pendingRequestsRef.current.delete(id);
+          }
+          break;
+        }
+
+        case 'SYNC_DELTAS_RESULT': {
+          const res = response as SyncDeltasResultResponse;
+          setDbStats(res.status);
+          setDeltaSync(res.result);
+          if (pending) {
+            pending.resolve(res.result);
             pendingRequestsRef.current.delete(id);
           }
           break;
@@ -318,6 +340,17 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
     } as WorkerRequest);
   }, [getNextId]);
 
+  // Manual EOD Delta synchronization trigger
+  const syncDeltas = useCallback(async (): Promise<DeltaSyncResult> => {
+    const id = getNextId();
+    return sendWorkerMessage({
+      id,
+      type: 'SYNC_DELTAS',
+      version: APP_DB_VERSION,
+      apiOrigin: typeof window !== 'undefined' ? window.location.origin : undefined,
+    });
+  }, [getNextId, sendWorkerMessage]);
+
   // Execute typed SQL query against the WASM database
   const runQuery = useCallback(
     async <T = any>(sql: string, params?: any[]): Promise<T[]> => {
@@ -351,8 +384,10 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
     progressMessage,
     error,
     dbStats,
+    deltaSync,
     hasCachedData,
     startWarmup,
+    syncDeltas,
     runQuery,
     runRealBacktest,
     checkCache,

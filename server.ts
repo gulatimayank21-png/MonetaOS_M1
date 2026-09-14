@@ -205,6 +205,37 @@ app.get('/api/database/proxy-release-db', async (req, res) => {
   }
 });
 
+// API: Proxy EOD Delta JSON from GitHub Pages (bypasses browser CORS / sandbox constraints)
+app.get('/api/database/proxy-delta', async (req, res) => {
+  const targetUrl =
+    (req.query.url as string) ||
+    'https://gulatimayank21-png.github.io/MonetaOS_M1/latest_deltas.json';
+  try {
+    const remoteRes = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonetaOS/1.0',
+        Accept: 'application/json',
+      },
+    });
+
+    if (!remoteRes.ok) {
+      return res.status(remoteRes.status).json({
+        error: `Remote delta server returned ${remoteRes.status}: ${remoteRes.statusText}`,
+      });
+    }
+
+    const data = await remoteRes.json();
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json');
+    res.json(data);
+  } catch (err: any) {
+    console.warn('[Proxy Delta Error]:', err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: err.message || 'Failed to proxy delta feed' });
+    }
+  }
+});
+
 app.post('/api/database/upload-historical-db', async (req, res) => {
   try {
     const filename = (req.headers['x-filename'] as string) || 'historical_market.db';

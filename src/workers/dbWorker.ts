@@ -26,6 +26,7 @@ import {
   STORAGE_VERSION_KEY,
   DB_FILENAME,
 } from '../constants/database';
+import { syncLatestDeltas, DeltaSyncResult } from '../utils/deltaSyncService';
 
 export const DEFAULT_DB_URL = DB_DOWNLOAD_URL;
 export const DB_VERSION_TAG = APP_DB_VERSION;
@@ -37,7 +38,8 @@ export type WorkerRequestType =
   | 'WARMUP_DB'
   | 'GET_DB_STATUS'
   | 'EXECUTE_QUERY'
-  | 'RUN_BACKTEST';
+  | 'RUN_BACKTEST'
+  | 'SYNC_DELTAS';
 
 export interface CheckCacheRequest {
   id: string;
@@ -71,12 +73,20 @@ export interface RunBacktestRequest {
   config: BacktestConfig;
 }
 
+export interface SyncDeltasRequest {
+  id: string;
+  type: 'SYNC_DELTAS';
+  apiOrigin?: string;
+  version?: string;
+}
+
 export type WorkerRequest =
   | CheckCacheRequest
   | WarmupDbRequest
   | GetDbStatusRequest
   | ExecuteQueryRequest
-  | RunBacktestRequest;
+  | RunBacktestRequest
+  | SyncDeltasRequest;
 
 export type WorkerResponseType =
   | 'PROGRESS'
@@ -85,6 +95,7 @@ export type WorkerResponseType =
   | 'CHECK_CACHE_RESULT'
   | 'WARMUP_COMPLETE'
   | 'BACKTEST_COMPLETE'
+  | 'SYNC_DELTAS_RESULT'
   | 'ERROR';
 
 export interface ProgressResponse {
@@ -105,12 +116,20 @@ export interface DbStatusData {
   tableName: string;
   sizeBytes: number;
   tables: string[];
+  deltaSync?: DeltaSyncResult;
 }
 
 export interface StatusResultResponse {
   id: string;
   type: 'STATUS_RESULT';
   data: DbStatusData;
+}
+
+export interface SyncDeltasResultResponse {
+  id: string;
+  type: 'SYNC_DELTAS_RESULT';
+  result: DeltaSyncResult;
+  status: DbStatusData;
 }
 
 export interface QueryResultResponse {
@@ -135,6 +154,7 @@ export interface WarmupCompleteResponse {
   fromCache: boolean;
   sizeBytes: number;
   status: DbStatusData;
+  deltaSync?: DeltaSyncResult;
 }
 
 export interface BacktestCompleteResponse {
@@ -158,6 +178,7 @@ export type WorkerResponse =
   | CheckCacheResponse
   | WarmupCompleteResponse
   | BacktestCompleteResponse
+  | SyncDeltasResultResponse
   | ErrorResponse;
 
 // --- Worker State ---
@@ -666,28 +687,152 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         // Invalidate cached market matrix when new DB is loaded
         cachedMarketMatrix = null;
 
-        // Step 4: Inspect and cache database status
-        const status = inspectDatabase(dbInstance, buffer.byteLength);
+        // Step 4: Automatic Daily EOD Delta Synchronization
+        self.postMessage({
+          id,
+          type: 'PROGRESS',
+          phase: 'initializing',
+          loadedBytes: buffer.byteLength,
+          totalBytes: buffer.byteLength,
+          percent: 95,
+          message: 'Checking and applying latest EOD market candles from remote delta feed...',
+        } as ProgressResponse);
+
+        let deltaSyncResult: DeltaSyncResult | undefined;
+        try {
+          deltaSyncResult = await syncLatestDeltas(dbInstance, {
+            apiOrigin: warmupReq.apiOrigin,
+            onProgress: (msg) => {
+              self.postMessage({
+                id,
+                type: 'PROGRESS',
+                phase: 'initializing',
+                loadedBytes: buffer.byteLength,
+                totalBytes: buffer.byteLength,
+                percent: 97,
+                message: msg,
+              } as ProgressResponse);
+            },
+          });
+
+          // Step 5: If new records were inserted, persist updated SQLite binary to browser storage (IndexedDB)
+          if (deltaSyncResult && deltaSyncResult.syncedCount > 0) {
+            self.postMessage({
+              id,
+              type: 'PROGRESS',
+              phase: 'saving',
+              loadedBytes: buffer.byteLength,
+              totalBytes: buffer.byteLength,
+              percent: 98,
+              message: `Persisting updated database (${deltaSyncResult.syncedCount} new candles) to browser storage...`,
+            } as ProgressResponse);
+
+            const exportedBinary = dbInstance.export();
+            const updatedBuffer = exportedBinary.buffer.slice(
+              exportedBinary.byteOffset,
+              exportedBinary.byteOffset + exportedBinary.byteLength
+            );
+            rawBuffer = updatedBuffer;
+            try {
+              await saveDatabaseBuffer(updatedBuffer, targetVersion);
+            } catch (persistErr) {
+              console.warn('[EOD Delta Sync] Could not save updated binary to IndexedDB:', persistErr);
+            }
+          }
+        } catch (deltaErr) {
+          console.warn('[EOD Delta Sync Non-blocking Error]:', deltaErr);
+        }
+
+        // Step 6: Inspect and cache database status
+        const currentByteLength = rawBuffer ? rawBuffer.byteLength : buffer.byteLength;
+        const status = inspectDatabase(dbInstance, currentByteLength);
+        if (deltaSyncResult) {
+          status.deltaSync = deltaSyncResult;
+        }
         cachedStatus = status;
+
+        const syncNote = deltaSyncResult && deltaSyncResult.syncedCount > 0
+          ? ` • Synced ${deltaSyncResult.syncedCount} new candles through ${deltaSyncResult.maxDate}`
+          : '';
 
         self.postMessage({
           id,
           type: 'PROGRESS',
           phase: 'ready',
-          loadedBytes: buffer.byteLength,
-          totalBytes: buffer.byteLength,
+          loadedBytes: currentByteLength,
+          totalBytes: currentByteLength,
           percent: 100,
-          message: `Database ${targetVersion} loaded successfully (${status.totalCandles.toLocaleString()} candles across ${status.uniqueSymbols} symbols).`,
+          message: `Database ${targetVersion} ready (${status.totalCandles.toLocaleString()} candles across ${status.uniqueSymbols} symbols${syncNote}).`,
         } as ProgressResponse);
 
         self.postMessage({
           id,
           type: 'WARMUP_COMPLETE',
           fromCache,
-          sizeBytes: buffer.byteLength,
+          sizeBytes: currentByteLength,
           status,
+          deltaSync: deltaSyncResult,
         } as WarmupCompleteResponse);
 
+        break;
+      }
+
+      case 'SYNC_DELTAS': {
+        const syncReq = request as SyncDeltasRequest;
+        const targetVersion = syncReq.version || DB_VERSION_TAG;
+
+        if (!dbInstance) {
+          const cached = await getDatabaseBuffer();
+          if (cached && cached.buffer) {
+            const SQL = await getSQL();
+            rawBuffer = cached.buffer;
+            dbInstance = new SQL.Database(new Uint8Array(cached.buffer));
+          } else {
+            throw new Error('Historical database is not loaded. Please warmup or download the database first.');
+          }
+        }
+
+        const deltaResult = await syncLatestDeltas(dbInstance, {
+          apiOrigin: syncReq.apiOrigin,
+          onProgress: (msg) => {
+            self.postMessage({
+              id,
+              type: 'PROGRESS',
+              phase: 'initializing',
+              loadedBytes: rawBuffer ? rawBuffer.byteLength : 0,
+              totalBytes: rawBuffer ? rawBuffer.byteLength : 0,
+              percent: 95,
+              message: msg,
+            } as ProgressResponse);
+          },
+        });
+
+        if (deltaResult.syncedCount > 0) {
+          const exportedBinary = dbInstance.export();
+          const updatedBuffer = exportedBinary.buffer.slice(
+            exportedBinary.byteOffset,
+            exportedBinary.byteOffset + exportedBinary.byteLength
+          );
+          rawBuffer = updatedBuffer;
+          cachedMarketMatrix = null;
+          try {
+            await saveDatabaseBuffer(updatedBuffer, targetVersion);
+          } catch (persistErr) {
+            console.warn('[EOD Delta Sync] Could not save updated binary to IndexedDB:', persistErr);
+          }
+        }
+
+        const currentByteLength = rawBuffer ? rawBuffer.byteLength : 0;
+        const status = inspectDatabase(dbInstance, currentByteLength);
+        status.deltaSync = deltaResult;
+        cachedStatus = status;
+
+        self.postMessage({
+          id,
+          type: 'SYNC_DELTAS_RESULT',
+          result: deltaResult,
+          status,
+        } as SyncDeltasResultResponse);
         break;
       }
 
