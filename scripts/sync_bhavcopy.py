@@ -9,7 +9,6 @@ import pandas as pd
 PUBLIC_DIR = "./public"
 os.makedirs(PUBLIC_DIR, exist_ok=True)
 
-# Standard browser headers required for static asset retrieval
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept": "*/*",
@@ -17,12 +16,8 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
-def fetch_bhavcopy_deltas():
-    # Testing with last active trading session: Friday Sep 11, 2026
-    target_date = datetime.date(2026, 9, 11)
+def fetch_bhavcopy_deltas(target_date: datetime.date):
     date_ymd = target_date.strftime("%Y%m%d")
-    
-    # Official Standardized UDiFF Bhavcopy static path on nsearchives
     filename = f"BhavCopy_NSE_CM_0_0_0_{date_ymd}_F_0000.csv.zip"
     url = f"https://nsearchives.nseindia.com/content/cm/{filename}"
     
@@ -40,7 +35,6 @@ def fetch_bhavcopy_deltas():
         print(f"Failed to fetch Bhavcopy (HTTP Status: {res.status_code}).")
         return []
 
-    # Read zip in memory
     try:
         with zipfile.ZipFile(io.BytesIO(res.content)) as z:
             csv_name = z.namelist()[0]
@@ -50,18 +44,14 @@ def fetch_bhavcopy_deltas():
         print(f"Failed to decompress zip archive: {e}")
         return []
 
-    # Clean column names
     df.columns = [c.strip() for c in df.columns]
 
-    # UDiFF column specs:
-    # TckrSymb (Ticker), SctySrs (Series), OpnPric, HghPric, LwPric, ClsPric, TtlTradgVol
     if "SctySrs" in df.columns:
         df = df[df['SctySrs'].isin(['EQ', 'BE'])].copy()
         sym_col, open_col, high_col, low_col, close_col, vol_col = (
             "TckrSymb", "OpnPric", "HghPric", "LwPric", "ClsPric", "TtlTradgVol"
         )
     else:
-        # Fallback if legacy columns are present
         df = df[df['SERIES'].isin(['EQ', 'BE'])].copy()
         sym_col, open_col, high_col, low_col, close_col, vol_col = (
             "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "TOTTRDQTY"
@@ -85,20 +75,79 @@ def fetch_bhavcopy_deltas():
 
     return deltas
 
-def main():
-    deltas = fetch_bhavcopy_deltas()
+def fetch_corporate_action_alerts():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-actions"
+    })
     
+    alerts = []
+    try:
+        # Prime session cookies on the corporate action landing page
+        session.get("https://www.nseindia.com/companies-listing/corporate-filings-actions", timeout=15)
+        
+        api_url = "https://www.nseindia.com/api/corporates-corporateActions?index=equities"
+        res = session.get(api_url, timeout=15)
+        
+        if res.status_code == 200:
+            actions = res.json()
+            for act in actions:
+                subj = str(act.get("subject", "")).lower()
+                if any(w in subj for w in ["split", "sub-division", "bonus", "merger", "amalgamation", "demerger"]):
+                    alerts.append({
+                        "symbol": act.get("symbol"),
+                        "series": act.get("series"),
+                        "subject": act.get("subject"),
+                        "ex_date": act.get("exDate"),
+                        "record_date": act.get("recDate"),
+                        "ca_broadcast_date": act.get("bcStartDate")
+                    })
+            print(f"Successfully collected {len(alerts)} corporate action alerts from NSE.")
+        else:
+            print(f"Corporate actions endpoint returned HTTP {res.status_code} (Firewall/Bot challenge).")
+    except Exception as e:
+        print(f"Warning: Could not fetch corporate actions: {e}")
+        
+    return alerts
+
+def main():
+    # Target date: Sep 11, 2026 for testing; replace with datetime.date.today() for live EOD
+    target_date = datetime.date(2026, 9, 11)
+    
+    # 1. Fetch Bhavcopy
+    deltas = fetch_bhavcopy_deltas(target_date)
+    
+    # 2. Fetch Corporate Actions
+    alerts = fetch_corporate_action_alerts()
+
+    # 3. Output files into ./public
     output_deltas = {
         "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "target_date": target_date.strftime("%Y-%m-%d"),
         "record_count": len(deltas),
         "data": deltas
     }
 
-    out_file = os.path.join(PUBLIC_DIR, "latest_deltas.json")
-    with open(out_file, "w") as f:
+    output_alerts = {
+        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "alerts_count": len(alerts),
+        "alerts": alerts
+    }
+
+    deltas_path = os.path.join(PUBLIC_DIR, "latest_deltas.json")
+    alerts_path = os.path.join(PUBLIC_DIR, "corporate_alerts.json")
+
+    with open(deltas_path, "w") as f:
         json.dump(output_deltas, f)
 
-    print(f"Generated {len(deltas)} deltas in {out_file}")
+    with open(alerts_path, "w") as f:
+        json.dump(output_alerts, f, indent=2)
+
+    print(f"Saved {len(deltas)} candles to {deltas_path}")
+    print(f"Saved {len(alerts)} alerts to {alerts_path}")
 
 if __name__ == "__main__":
     main()
