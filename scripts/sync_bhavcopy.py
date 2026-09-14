@@ -9,102 +9,96 @@ import pandas as pd
 PUBLIC_DIR = "./public"
 os.makedirs(PUBLIC_DIR, exist_ok=True)
 
+# Standard browser headers required for static asset retrieval
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive"
 }
 
-def get_nse_session():
+def fetch_bhavcopy_deltas():
+    # Testing with last active trading session: Friday Sep 11, 2026
+    target_date = datetime.date(2026, 9, 11)
+    date_ymd = target_date.strftime("%Y%m%d")
+    
+    # Official Standardized UDiFF Bhavcopy static path on nsearchives
+    filename = f"BhavCopy_NSE_CM_0_0_0_{date_ymd}_F_0000.csv.zip"
+    url = f"https://nsearchives.nseindia.com/content/cm/{filename}"
+    
+    print(f"Requesting static Bhavcopy from: {url}")
     session = requests.Session()
     session.headers.update(HEADERS)
-    # Prime session cookies by hitting the homepage first
-    session.get("https://www.nseindia.com", timeout=15)
-    return session
-
-def fetch_bhavcopy_deltas(session):
-    today = datetime.date(2026, 9, 11)
-    date_str = today.strftime("%d%m%Y")
     
-    # Modern NSE consolidated Bhavcopy endpoint
-    # Format: sec_bhavdata_full_DDMMYYYY.csv
-    url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
-    
-    res = session.get(url, timeout=20)
-    if res.status_code != 200:
-        print(f"Bhavcopy not available for {date_str} (Status: {res.status_code}). Market may be closed or file pending.")
+    try:
+        res = session.get(url, timeout=25)
+    except Exception as e:
+        print(f"Network connection error: {e}")
         return []
 
-    df = pd.read_csv(io.StringIO(res.text))
-    # Standardize column names (strip whitespace)
+    if res.status_code != 200:
+        print(f"Failed to fetch Bhavcopy (HTTP Status: {res.status_code}).")
+        return []
+
+    # Read zip in memory
+    try:
+        with zipfile.ZipFile(io.BytesIO(res.content)) as z:
+            csv_name = z.namelist()[0]
+            with z.open(csv_name) as f:
+                df = pd.read_csv(f)
+    except Exception as e:
+        print(f"Failed to decompress zip archive: {e}")
+        return []
+
+    # Clean column names
     df.columns = [c.strip() for c in df.columns]
 
-    # Filter to standard cash equity series ('EQ' and surveillance 'BE')
-    df = df[df['SERIES'].isin(['EQ', 'BE'])]
+    # UDiFF column specs:
+    # TckrSymb (Ticker), SctySrs (Series), OpnPric, HghPric, LwPric, ClsPric, TtlTradgVol
+    if "SctySrs" in df.columns:
+        df = df[df['SctySrs'].isin(['EQ', 'BE'])].copy()
+        sym_col, open_col, high_col, low_col, close_col, vol_col = (
+            "TckrSymb", "OpnPric", "HghPric", "LwPric", "ClsPric", "TtlTradgVol"
+        )
+    else:
+        # Fallback if legacy columns are present
+        df = df[df['SERIES'].isin(['EQ', 'BE'])].copy()
+        sym_col, open_col, high_col, low_col, close_col, vol_col = (
+            "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "TOTTRDQTY"
+        )
 
     deltas = []
+    trade_date_str = target_date.strftime("%Y-%m-%d")
     for _, row in df.iterrows():
-        deltas.append({
-            "symbol": str(row['SYMBOL']).strip(),
-            "trade_date": today.strftime("%Y-%m-%d"),
-            "open": float(row['OPEN_PRICE']),
-            "high": float(row['HIGH_PRICE']),
-            "low": float(row['LOW_PRICE']),
-            "close": float(row['CLOSE_PRICE']),
-            "volume": int(row['TTL_TRD_QNTY'])
-        })
+        try:
+            deltas.append({
+                "symbol": str(row[sym_col]).strip(),
+                "trade_date": trade_date_str,
+                "open": float(row[open_col]),
+                "high": float(row[high_col]),
+                "low": float(row[low_col]),
+                "close": float(row[close_col]),
+                "volume": int(row[vol_col])
+            })
+        except (ValueError, TypeError):
+            continue
+
     return deltas
 
-def check_corporate_actions(session):
-    url = "https://www.nseindia.com/api/corporates-corporateActions?index=equities"
-    alerts = []
-    try:
-        res = session.get(url, timeout=15)
-        if res.status_code == 200:
-            actions = res.json()
-            for act in actions:
-                subj = act.get("subject", "").lower()
-                # Flag splits, bonuses, mergers, and demergers
-                if any(w in subj for w in ["split", "bonus", "merger", "amalgamation", "demerger"]):
-                    alerts.append({
-                        "symbol": act.get("symbol"),
-                        "subject": act.get("subject"),
-                        "ex_date": act.get("exDate"),
-                        "record_date": act.get("recDate")
-                    })
-    except Exception as e:
-        print(f"Warning: Could not fetch corporate actions: {e}")
-    return alerts
-
 def main():
-    session = get_nse_session()
+    deltas = fetch_bhavcopy_deltas()
     
-    # 1. Fetch EOD Bhavcopy
-    deltas = fetch_bhavcopy_deltas(session)
-    
-    # 2. Check Corporate Action Circulars
-    alerts = check_corporate_actions(session)
-
-    # 3. Export to ./public directory
     output_deltas = {
         "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
         "record_count": len(deltas),
         "data": deltas
     }
-    
-    output_alerts = {
-        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
-        "alerts_count": len(alerts),
-        "alerts": alerts
-    }
 
-    with open(os.path.join(PUBLIC_DIR, "latest_deltas.json"), "w") as f:
+    out_file = os.path.join(PUBLIC_DIR, "latest_deltas.json")
+    with open(out_file, "w") as f:
         json.dump(output_deltas, f)
 
-    with open(os.path.join(PUBLIC_DIR, "corporate_alerts.json"), "w") as f:
-        json.dump(output_alerts, f, indent=2)
-
-    print(f"Generated {len(deltas)} deltas and {len(alerts)} alerts in {PUBLIC_DIR}")
+    print(f"Generated {len(deltas)} deltas in {out_file}")
 
 if __name__ == "__main__":
     main()
