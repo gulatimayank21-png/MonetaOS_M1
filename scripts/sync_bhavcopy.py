@@ -16,7 +16,18 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
+def get_current_ist_date() -> datetime.date:
+    """Returns today's date in Indian Standard Time (UTC + 5:30)."""
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    ist_now = utc_now + datetime.timedelta(hours=5, minutes=30)
+    return ist_now.date()
+
 def fetch_bhavcopy_deltas(target_date: datetime.date):
+    # Weekday check: Monday = 0, Sunday = 6
+    if target_date.weekday() >= 5:
+        print(f"{target_date} is a weekend. Market closed.")
+        return []
+
     date_ymd = target_date.strftime("%Y%m%d")
     filename = f"BhavCopy_NSE_CM_0_0_0_{date_ymd}_F_0000.csv.zip"
     url = f"https://nsearchives.nseindia.com/content/cm/{filename}"
@@ -32,7 +43,7 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
         return []
 
     if res.status_code != 200:
-        print(f"Failed to fetch Bhavcopy (HTTP Status: {res.status_code}).")
+        print(f"No Bhavcopy available for {target_date} (Status: {res.status_code}). Likely exchange holiday or file not published yet.")
         return []
 
     try:
@@ -86,9 +97,7 @@ def fetch_corporate_action_alerts():
     
     alerts = []
     try:
-        # Prime session cookies on the corporate action landing page
         session.get("https://www.nseindia.com/companies-listing/corporate-filings-actions", timeout=15)
-        
         api_url = "https://www.nseindia.com/api/corporates-corporateActions?index=equities"
         res = session.get(api_url, timeout=15)
         
@@ -107,32 +116,28 @@ def fetch_corporate_action_alerts():
                     })
             print(f"Successfully collected {len(alerts)} corporate action alerts from NSE.")
         else:
-            print(f"Corporate actions endpoint returned HTTP {res.status_code} (Firewall/Bot challenge).")
+            print(f"Corporate actions endpoint returned HTTP {res.status_code}.")
     except Exception as e:
         print(f"Warning: Could not fetch corporate actions: {e}")
         
     return alerts
 
 def main():
-    # Target date: Sep 11, 2026 for testing; replace with datetime.date.today() for live EOD
-    target_date = datetime.date(2026, 9, 11)
+    target_date = get_current_ist_date()
+    print(f"Executing sync for IST date: {target_date}")
     
-    # 1. Fetch Bhavcopy
     deltas = fetch_bhavcopy_deltas(target_date)
-    
-    # 2. Fetch Corporate Actions
     alerts = fetch_corporate_action_alerts()
 
-    # 3. Output files into ./public
     output_deltas = {
-        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "target_date": target_date.strftime("%Y-%m-%d"),
         "record_count": len(deltas),
         "data": deltas
     }
 
     output_alerts = {
-        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "alerts_count": len(alerts),
         "alerts": alerts
     }
