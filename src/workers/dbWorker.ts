@@ -6,7 +6,7 @@
  */
 
 import initSqlJs, { Database, SqlJsStatic } from 'sql.js';
-import JSZip from 'jszip';
+import { unzipSync } from 'fflate';
 import {
   getDatabaseBuffer,
   saveDatabaseBuffer,
@@ -19,7 +19,7 @@ import {
   buildMarketMatrix,
   InMemMarketMatrix,
 } from '../utils/realDataBacktestEngine';
-import { BacktestConfig, BacktestSummary } from '../types';
+import { BacktestConfig, BacktestSummary, ComputedStockMetric } from '../types';
 import {
   APP_DB_VERSION,
   DB_DOWNLOAD_URL,
@@ -39,7 +39,8 @@ export type WorkerRequestType =
   | 'GET_DB_STATUS'
   | 'EXECUTE_QUERY'
   | 'RUN_BACKTEST'
-  | 'SYNC_DELTAS';
+  | 'SYNC_DELTAS'
+  | 'COMPUTE_LATEST_METRICS';
 
 export interface CheckCacheRequest {
   id: string;
@@ -80,13 +81,19 @@ export interface SyncDeltasRequest {
   version?: string;
 }
 
+export interface ComputeLatestMetricsRequest {
+  id: string;
+  type: 'COMPUTE_LATEST_METRICS';
+}
+
 export type WorkerRequest =
   | CheckCacheRequest
   | WarmupDbRequest
   | GetDbStatusRequest
   | ExecuteQueryRequest
   | RunBacktestRequest
-  | SyncDeltasRequest;
+  | SyncDeltasRequest
+  | ComputeLatestMetricsRequest;
 
 export type WorkerResponseType =
   | 'PROGRESS'
@@ -96,6 +103,7 @@ export type WorkerResponseType =
   | 'WARMUP_COMPLETE'
   | 'BACKTEST_COMPLETE'
   | 'SYNC_DELTAS_RESULT'
+  | 'LATEST_METRICS_RESULT'
   | 'ERROR';
 
 export interface ProgressResponse {
@@ -130,6 +138,7 @@ export interface SyncDeltasResultResponse {
   type: 'SYNC_DELTAS_RESULT';
   result: DeltaSyncResult;
   status: DbStatusData;
+  computedMetrics?: ComputedStockMetric[];
 }
 
 export interface QueryResultResponse {
@@ -155,6 +164,15 @@ export interface WarmupCompleteResponse {
   sizeBytes: number;
   status: DbStatusData;
   deltaSync?: DeltaSyncResult;
+  computedMetrics?: ComputedStockMetric[];
+}
+
+export interface LatestMetricsResultResponse {
+  id: string;
+  type: 'LATEST_METRICS_RESULT';
+  metrics: ComputedStockMetric[];
+  maxDate: string;
+  totalComputed: number;
 }
 
 export interface BacktestCompleteResponse {
@@ -179,6 +197,7 @@ export type WorkerResponse =
   | WarmupCompleteResponse
   | BacktestCompleteResponse
   | SyncDeltasResultResponse
+  | LatestMetricsResultResponse
   | ErrorResponse;
 
 // --- Worker State ---
@@ -234,22 +253,25 @@ async function uncompressIfZip(
   }
 
   if (onProgress) {
-    onProgress('Decompressing SQLite database from ZIP archive in worker...');
+    onProgress('Decompressing SQLite database from ZIP archive with fflate in worker...');
   }
 
-  const zip = await JSZip.loadAsync(buffer);
-  const fileNames = Object.keys(zip.files);
+  const unzipped = unzipSync(new Uint8Array(buffer));
+  const fileNames = Object.keys(unzipped);
   const targetName =
-    fileNames.find((name) => /\.(db|sqlite|sqlite3)$/i.test(name) && !zip.files[name].dir) ||
-    fileNames.find((name) => !zip.files[name].dir) ||
+    fileNames.find((name) => /\.(db|sqlite|sqlite3)$/i.test(name) && unzipped[name].length > 0) ||
+    fileNames.find((name) => unzipped[name].length > 0) ||
     fileNames[0];
 
-  if (!targetName || !zip.files[targetName]) {
+  if (!targetName || !unzipped[targetName] || unzipped[targetName].length === 0) {
     throw new Error('No valid SQLite .db file found inside the release ZIP archive.');
   }
 
-  const extracted = await zip.files[targetName].async('arraybuffer');
-  return extracted;
+  const extractedU8 = unzipped[targetName];
+  return extractedU8.buffer.slice(
+    extractedU8.byteOffset,
+    extractedU8.byteOffset + extractedU8.byteLength
+  );
 }
 
 /**
@@ -321,6 +343,113 @@ function inspectDatabase(db: Database, sizeBytes: number): DbStatusData {
     sizeBytes,
     tables,
   };
+}
+
+/**
+ * Computes latest quant metrics (1M, 3M, 1Y returns, 52W High/Low, CMP)
+ * across all symbols directly from the SQLite historical database candles
+ */
+function computeLatestMetricsFromDb(db: Database): {
+  metrics: ComputedStockMetric[];
+  maxDate: string;
+  totalComputed: number;
+} {
+  const masterTablesRes = db.exec("SELECT name FROM sqlite_master WHERE type='table';");
+  const tableNames = masterTablesRes[0]?.values ? masterTablesRes[0].values.map((v) => String(v[0]).toLowerCase()) : [];
+  const candleTable = tableNames.includes('daily_ohlcv')
+    ? 'daily_ohlcv'
+    : tableNames.includes('stock_daily_ohlcv')
+    ? 'stock_daily_ohlcv'
+    : tableNames.find((t) => /ohlc|candle|daily|price/i.test(t)) || 'daily_ohlcv';
+
+  const colRes = db.exec(`PRAGMA table_info("${candleTable}");`);
+  const cols = colRes[0]?.values ? colRes[0].values.map((c) => String(c[1]).toLowerCase()) : [];
+  const dateCol = cols.includes('trade_date') ? 'trade_date' : cols.includes('date') ? 'date' : 'date';
+
+  const sql = `SELECT symbol, ${dateCol} as trade_date, open, high, low, close FROM "${candleTable}" ORDER BY symbol, ${dateCol} ASC;`;
+  const res = db.exec(sql);
+
+  if (!res || res.length === 0 || !res[0].values) {
+    return { metrics: [], maxDate: '', totalComputed: 0 };
+  }
+
+  const values = res[0].values;
+  const symbolMap = new Map<string, Array<{ date: string; high: number; low: number; close: number }>>();
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
+    const sym = String(row[0]).toUpperCase();
+    const dt = String(row[1]);
+    const h = Number(row[3]) || Number(row[5]);
+    const l = Number(row[4]) || Number(row[5]);
+    const c = Number(row[5]);
+
+    let list = symbolMap.get(sym);
+    if (!list) {
+      list = [];
+      symbolMap.set(sym, list);
+    }
+    list.push({ date: dt, high: h, low: l, close: c });
+  }
+
+  let globalMaxDate = '';
+  const metrics: ComputedStockMetric[] = [];
+
+  for (const [sym, candles] of symbolMap.entries()) {
+    if (candles.length === 0) continue;
+    const len = candles.length;
+    const last = candles[len - 1];
+    if (!globalMaxDate || last.date > globalMaxDate) {
+      globalMaxDate = last.date;
+    }
+
+    const lastClose = Number(last.close.toFixed(2));
+    const cmp = lastClose;
+
+    // Last ~252 candles for 52W High / Low
+    const lookback52W = candles.slice(Math.max(0, len - 252));
+    let high52w = lastClose;
+    let low52w = lastClose;
+    for (let k = 0; k < lookback52W.length; k++) {
+      if (lookback52W[k].high > high52w) high52w = lookback52W[k].high;
+      if (lookback52W[k].low < low52w) low52w = lookback52W[k].low;
+    }
+    high52w = Number(high52w.toFixed(2));
+    low52w = Number(low52w.toFixed(2));
+
+    const c1M = candles[Math.max(0, len - 22)]?.close || lastClose;
+    const c3M = candles[Math.max(0, len - 64)]?.close || lastClose;
+    const c1Y = candles[Math.max(0, len - 253)]?.close || lastClose;
+
+    const return1M = Number((((lastClose - c1M) / c1M) * 100).toFixed(1));
+    const return3M = Number((((lastClose - c3M) / c3M) * 100).toFixed(1));
+    const return1Y = Number((((lastClose - c1Y) / c1Y) * 100).toFixed(1));
+
+    // Previous periods for rebalance status
+    const prevC1M = candles[Math.max(0, len - 43)]?.close || c1M;
+    const previousReturn1M = Number((((c1M - prevC1M) / prevC1M) * 100).toFixed(1));
+
+    const prevC3M = candles[Math.max(0, len - 127)]?.close || c3M;
+    const previousReturn3M = Number((((c3M - prevC3M) / prevC3M) * 100).toFixed(1));
+
+    metrics.push({
+      symbol: sym.endsWith('.NS') ? sym : `${sym}.NS`,
+      ticker: sym.replace(/\.NS$/, ''),
+      lastClose,
+      cmp,
+      cmpChangePct: 0,
+      high52w,
+      low52w,
+      return1M,
+      return3M,
+      return1Y,
+      previousReturn1M,
+      previousReturn3M,
+      latestTradeDate: last.date,
+    });
+  }
+
+  return { metrics, maxDate: globalMaxDate, totalComputed: metrics.length };
 }
 
 /**
@@ -743,13 +872,20 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           console.warn('[EOD Delta Sync Non-blocking Error]:', deltaErr);
         }
 
-        // Step 6: Inspect and cache database status
+        // Step 6: Inspect and cache database status & compute latest universe metrics
         const currentByteLength = rawBuffer ? rawBuffer.byteLength : buffer.byteLength;
         const status = inspectDatabase(dbInstance, currentByteLength);
         if (deltaSyncResult) {
           status.deltaSync = deltaSyncResult;
         }
         cachedStatus = status;
+
+        let computedMetricsResult: { metrics: ComputedStockMetric[]; maxDate: string; totalComputed: number } | undefined;
+        try {
+          computedMetricsResult = computeLatestMetricsFromDb(dbInstance);
+        } catch (calcErr) {
+          console.warn('[Compute Metrics Error in Warmup]:', calcErr);
+        }
 
         const syncNote = deltaSyncResult && deltaSyncResult.syncedCount > 0
           ? ` • Synced ${deltaSyncResult.syncedCount} new candles through ${deltaSyncResult.maxDate}`
@@ -772,6 +908,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           sizeBytes: currentByteLength,
           status,
           deltaSync: deltaSyncResult,
+          computedMetrics: computedMetricsResult?.metrics,
         } as WarmupCompleteResponse);
 
         break;
@@ -827,11 +964,19 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         status.deltaSync = deltaResult;
         cachedStatus = status;
 
+        let deltaComputedMetrics: { metrics: ComputedStockMetric[]; maxDate: string; totalComputed: number } | undefined;
+        try {
+          deltaComputedMetrics = computeLatestMetricsFromDb(dbInstance);
+        } catch (calcErr) {
+          console.warn('[Compute Metrics Error in Sync Deltas]:', calcErr);
+        }
+
         self.postMessage({
           id,
           type: 'SYNC_DELTAS_RESULT',
           result: deltaResult,
           status,
+          computedMetrics: deltaComputedMetrics?.metrics,
         } as SyncDeltasResultResponse);
         break;
       }
@@ -968,6 +1113,19 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
             }
           }
 
+          // Query macro_daily for benchmarks (Nifty 50, Nifty 500, India VIX, GoldBeES, LiquidBeES) (v2.1.0)
+          let macroRows: any[] = [];
+          if (tableNames.includes('macro_daily')) {
+            try {
+              const macroRes = dbInstance.exec('SELECT trade_date, index_name, open, high, low, close, volume FROM macro_daily ORDER BY trade_date, index_name;');
+              if (macroRes && macroRes[0]?.values) {
+                macroRows = macroRes[0].values;
+              }
+            } catch (err) {
+              console.warn('Could not query macro_daily:', err);
+            }
+          }
+
           self.postMessage({
             id,
             type: 'PROGRESS',
@@ -977,10 +1135,15 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
             percent: 50,
             message: `Indexing ${queryRes[0].values.length.toLocaleString()} candles with ${
               indexHistoryRows.length > 0 ? `${indexHistoryRows.length} reconstitution periods & ` : ''
-            }point-in-time universe filters...`,
+            }${macroRows.length > 0 ? `${macroRows.length} macro data points & ` : ''}point-in-time universe filters...`,
           } as ProgressResponse);
 
-          cachedMarketMatrix = buildMarketMatrix(queryRes[0].values, indexHistoryRows, lineageRows);
+          cachedMarketMatrix = buildMarketMatrix(
+            queryRes[0].values,
+            indexHistoryRows,
+            lineageRows,
+            macroRows
+          );
         }
 
         // 3. Execute Authentic Real-Data Quant Simulation
@@ -1028,6 +1191,29 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           summary,
           executionTimeMs,
         } as BacktestCompleteResponse);
+        break;
+      }
+
+      case 'COMPUTE_LATEST_METRICS': {
+        if (!dbInstance) {
+          const cached = await getDatabaseBuffer();
+          if (cached && cached.buffer) {
+            const SQL = await getSQL();
+            rawBuffer = cached.buffer;
+            dbInstance = new SQL.Database(new Uint8Array(cached.buffer));
+          } else {
+            throw new Error('Historical SQLite database is not loaded.');
+          }
+        }
+
+        const calc = computeLatestMetricsFromDb(dbInstance);
+        self.postMessage({
+          id,
+          type: 'LATEST_METRICS_RESULT',
+          metrics: calc.metrics,
+          maxDate: calc.maxDate,
+          totalComputed: calc.totalComputed,
+        } as LatestMetricsResultResponse);
         break;
       }
 

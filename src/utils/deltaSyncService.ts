@@ -21,12 +21,24 @@ export interface DeltaPayloadItem {
   volume: number | string;
 }
 
+export interface MacroDeltaPayloadItem {
+  index_name: string;
+  trade_date: string;
+  open: number | string;
+  high: number | string;
+  low: number | string;
+  close: number | string;
+  volume: number | string;
+}
+
 export interface DeltaPayload {
   updated_at?: string;
   target_date?: string;
   covered_dates?: string[];
   record_count?: number;
+  macro_count?: number;
   data: DeltaPayloadItem[];
+  macro_data?: MacroDeltaPayloadItem[];
 }
 
 export interface MissingStocksAudit {
@@ -39,7 +51,9 @@ export interface MissingStocksAudit {
 
 export interface DeltaSyncResult {
   syncedCount: number;
+  macroSyncedCount?: number;
   maxDate: string;
+  maxMacroDate?: string;
   previousMaxDate: string;
   message: string;
   timestamp: number;
@@ -96,7 +110,27 @@ export async function syncLatestDeltas(
       }
     } catch (_) {}
 
-    // Step 1: Check Local Baseline Date
+    // Ensure macro_daily table and indexes exist
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS macro_daily (
+            trade_date TEXT NOT NULL,
+            index_name TEXT NOT NULL,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL NOT NULL,
+            volume INTEGER,
+            PRIMARY KEY (trade_date, index_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_macro_date ON macro_daily(trade_date);
+        CREATE INDEX IF NOT EXISTS idx_macro_name_date ON macro_daily(index_name, trade_date);
+      `);
+    } catch (tblErr) {
+      console.warn('[EOD Delta Sync] Table init check for macro_daily warning:', tblErr);
+    }
+
+    // Step 1: Check Local Baseline Dates (Stocks & Macro)
     let maxLocalDate = '2015-01-01';
     try {
       const maxDateRes = db.exec(`SELECT MAX("${dateCol}") AS max_date FROM "${candleTable}";`);
@@ -104,10 +138,18 @@ export async function syncLatestDeltas(
         maxLocalDate = String(maxDateRes[0].values[0][0]);
       }
     } catch (err) {
-      console.warn('[EOD Delta Sync] Could not query max date, defaulting to 2015-01-01:', err);
+      console.warn('[EOD Delta Sync] Could not query max stock date, defaulting to 2015-01-01:', err);
     }
 
-    onProgress(`Checking for new candles beyond ${maxLocalDate}...`);
+    let maxLocalMacroDate = '2015-01-01';
+    try {
+      const maxMacroRes = db.exec(`SELECT MAX(trade_date) AS max_date FROM macro_daily;`);
+      if (maxMacroRes[0]?.values?.[0]?.[0]) {
+        maxLocalMacroDate = String(maxMacroRes[0].values[0][0]);
+      }
+    } catch (_) {}
+
+    onProgress(`Checking for new market & macro candles beyond ${maxLocalDate}...`);
 
     // Step 2: Fetch Remote Payload (with cache-busting timestamp)
     const timestamp = Date.now();
@@ -281,12 +323,21 @@ export async function syncLatestDeltas(
       return true;
     });
 
-    if (matchingRecords.length === 0) {
-      const msg = `Database is up to date through ${maxLocalDate}. No new deltas found.`;
+    // Filter macro_data records with trade_date > maxLocalMacroDate (or beyond maxLocalDate)
+    const matchingMacroRecords = (payload.macro_data || []).filter((item) => {
+      const tradeDate = item.trade_date;
+      if (!tradeDate) return false;
+      return tradeDate > maxLocalMacroDate || tradeDate > maxLocalDate;
+    });
+
+    if (matchingRecords.length === 0 && matchingMacroRecords.length === 0) {
+      const msg = `Database is up to date through ${maxLocalDate}. No new market or macro deltas found.`;
       console.log(`[EOD Delta Sync] ${msg}`);
       return {
         syncedCount: 0,
+        macroSyncedCount: 0,
         maxDate: maxLocalDate,
+        maxMacroDate: maxLocalMacroDate,
         previousMaxDate: maxLocalDate,
         message: msg,
         timestamp: Date.now(),
@@ -295,7 +346,9 @@ export async function syncLatestDeltas(
       };
     }
 
-    onProgress(`Upserting ${matchingRecords.length} new market candles into ${candleTable}...`);
+    onProgress(
+      `Upserting ${matchingRecords.length} stock candles and ${matchingMacroRecords.length} macro records into SQLite...`
+    );
 
     // Step 4: Batch Atomic UPSERT (Fault-tolerant: continues inserting valid candles)
     db.exec('BEGIN TRANSACTION;');
@@ -303,65 +356,102 @@ export async function syncLatestDeltas(
     let upsertSucceeded = false;
 
     // Primary attempt: standard SQLite ON CONFLICT(symbol, dateCol) DO UPDATE
-    try {
-      const upsertSql = `
-        INSERT INTO "${candleTable}" (symbol, ${dateCol}, open, high, low, close, volume)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(symbol, ${dateCol}) DO UPDATE SET
-          open = excluded.open,
-          high = excluded.high,
-          low = excluded.low,
-          close = excluded.close,
-          volume = excluded.volume;
-      `;
-      const stmt = db.prepare(upsertSql);
+    if (matchingRecords.length > 0) {
+      try {
+        const upsertSql = `
+          INSERT INTO "${candleTable}" (symbol, ${dateCol}, open, high, low, close, volume)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(symbol, ${dateCol}) DO UPDATE SET
+            open = excluded.open,
+            high = excluded.high,
+            low = excluded.low,
+            close = excluded.close,
+            volume = excluded.volume;
+        `;
+        const stmt = db.prepare(upsertSql);
 
-      for (const row of matchingRecords) {
-        stmt.run([
-          row.symbol,
-          row.trade_date,
-          Number(row.open),
-          Number(row.high),
-          Number(row.low),
-          Number(row.close),
-          Number(row.volume || 0),
-        ]);
+        for (const row of matchingRecords) {
+          stmt.run([
+            row.symbol,
+            row.trade_date,
+            Number(row.open),
+            Number(row.high),
+            Number(row.low),
+            Number(row.close),
+            Number(row.volume || 0),
+          ]);
+        }
+        stmt.free();
+        upsertSucceeded = true;
+      } catch (conflictErr) {
+        console.warn('[EOD Delta Sync] ON CONFLICT failed, trying INSERT OR REPLACE fallback:', conflictErr);
       }
-      stmt.free();
-      upsertSucceeded = true;
-    } catch (conflictErr) {
-      console.warn('[EOD Delta Sync] ON CONFLICT failed, trying INSERT OR REPLACE fallback:', conflictErr);
+
+      // Fallback attempt: INSERT OR REPLACE
+      if (!upsertSucceeded) {
+        const replaceSql = `
+          INSERT OR REPLACE INTO "${candleTable}" (symbol, ${dateCol}, open, high, low, close, volume)
+          VALUES (?, ?, ?, ?, ?, ?, ?);
+        `;
+        const stmt = db.prepare(replaceSql);
+        for (const row of matchingRecords) {
+          stmt.run([
+            row.symbol,
+            row.trade_date,
+            Number(row.open),
+            Number(row.high),
+            Number(row.low),
+            Number(row.close),
+            Number(row.volume || 0),
+          ]);
+        }
+        stmt.free();
+      }
     }
 
-    // Fallback attempt: INSERT OR REPLACE
-    if (!upsertSucceeded) {
-      const replaceSql = `
-        INSERT OR REPLACE INTO "${candleTable}" (symbol, ${dateCol}, open, high, low, close, volume)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
-      `;
-      const stmt = db.prepare(replaceSql);
-      for (const row of matchingRecords) {
-        stmt.run([
-          row.symbol,
-          row.trade_date,
-          Number(row.open),
-          Number(row.high),
-          Number(row.low),
-          Number(row.close),
-          Number(row.volume || 0),
-        ]);
+    // Upsert macro records into macro_daily table
+    let macroUpsertCount = 0;
+    if (matchingMacroRecords.length > 0) {
+      try {
+        const macroSql = `
+          INSERT OR REPLACE INTO macro_daily (trade_date, index_name, open, high, low, close, volume)
+          VALUES (?, ?, ?, ?, ?, ?, ?);
+        `;
+        const macroStmt = db.prepare(macroSql);
+        for (const mRow of matchingMacroRecords) {
+          macroStmt.run([
+            mRow.trade_date,
+            (mRow.index_name || '').trim().toUpperCase(),
+            Number(mRow.open || mRow.close),
+            Number(mRow.high || mRow.close),
+            Number(mRow.low || mRow.close),
+            Number(mRow.close),
+            Number(mRow.volume || 0),
+          ]);
+          macroUpsertCount++;
+        }
+        macroStmt.free();
+      } catch (macroErr) {
+        console.warn('[EOD Delta Sync] Failed inserting macro records into macro_daily:', macroErr);
       }
-      stmt.free();
     }
 
     db.exec('COMMIT;');
 
-    // Step 5: Query new max date after commit
+    // Step 5: Query new max dates after commit
     let newMaxDate = maxLocalDate;
     try {
       const newMaxRes = db.exec(`SELECT MAX("${dateCol}") AS max_date FROM "${candleTable}";`);
       if (newMaxRes[0]?.values?.[0]?.[0]) {
         newMaxDate = String(newMaxRes[0].values[0][0]);
+      }
+    } catch (_) {}
+
+    let newMaxMacroDate = maxLocalMacroDate;
+    try {
+      const newMaxMacroRes = db.exec(`SELECT MAX(trade_date) AS max_date FROM macro_daily;`);
+      if (newMaxMacroRes[0]?.values?.[0]?.[0]) {
+        newMaxMacroDate = String(newMaxMacroRes[0].values[0][0]);
       }
     } catch (_) {}
 
@@ -376,15 +466,18 @@ export async function syncLatestDeltas(
       missingWarningMessage = `⚠️ Data Sync Warning: ${totalMissing} stocks had missing candle data for ${datesStr} (e.g. ${sampleTickers}${moreCount})`;
     }
 
+    const macroNote = macroUpsertCount > 0 ? ` + ${macroUpsertCount} macro records` : '';
     const successMessage = hasMissingStocks
-      ? `Synced ${matchingRecords.length} candles through ${newMaxDate} (${missingAudits.length} dates had missing constituents)`
-      : `✅ Database synced: ${matchingRecords.length} candles added through ${newMaxDate}.`;
+      ? `Synced ${matchingRecords.length} candles${macroNote} through ${newMaxDate} (${missingAudits.length} dates had missing constituents)`
+      : `✅ Database synced: ${matchingRecords.length} stock candles${macroNote} added through ${newMaxDate}.`;
 
     console.log(`[EOD Delta Sync] ${successMessage}`);
 
     return {
       syncedCount: matchingRecords.length,
+      macroSyncedCount: macroUpsertCount,
       maxDate: newMaxDate,
+      maxMacroDate: newMaxMacroDate,
       previousMaxDate: maxLocalDate,
       message: successMessage,
       timestamp: Date.now(),

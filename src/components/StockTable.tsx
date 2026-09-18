@@ -201,8 +201,8 @@ export const StockTable: React.FC<StockTableProps> = ({
                           <span className="truncate max-w-[150px]">{stock.sector}</span>
                           {isTailwindSector && (
                             <span
-                              className="text-[9px] font-semibold text-purple-700 bg-purple-50 px-1 py-0.2 rounded border border-purple-200 shrink-0"
-                              title="Sector Tailwinds Play: Multiple overlapping winners in this sector"
+                              className="text-[9px] font-semibold text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded-sm border border-purple-200 shrink-0"
+                              title={`Sector Tailwind: ${stock.sector} shows robust sector-wide momentum (${tailwind?.baselineWinnerCount || 0} macro leaders in universe, ${tailwind?.overlappingCount || 0} in active filter)`}
                             >
                               Tailwind
                             </span>

@@ -5,6 +5,8 @@ import {
   EquityPoint,
   YearPerformance,
   StopLossMode,
+  BacktestWeightStrategy,
+  InvestmentMode,
 } from '../types';
 import {
   NIFTY500_HISTORICAL_RETURNS,
@@ -13,8 +15,88 @@ import {
 } from './backtestEngine';
 import { buildMacroDailyTimeline, isMacroCircuitBreakerActive } from './macroIndicators';
 
+/**
+ * Calculates Extended Internal Rate of Return (XIRR) using Newton-Raphson method
+ * cashFlows: Array of { date: string (YYYY-MM-DD), amount: number }
+ * Negative amounts = investments/inflows, Positive amounts = terminal value / withdrawals
+ */
+export function calculateXIRR(
+  cashFlows: Array<{ date: string; amount: number }>,
+  guess = 0.15
+): number {
+  if (!cashFlows || cashFlows.length < 2) return 0;
+
+  let hasNegative = false;
+  let hasPositive = false;
+  for (const cf of cashFlows) {
+    if (cf.amount < 0) hasNegative = true;
+    if (cf.amount > 0) hasPositive = true;
+  }
+  if (!hasNegative || !hasPositive) return 0;
+
+  const d0 = new Date(cashFlows[0].date).getTime();
+  const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
+
+  // NPV function
+  const f = (rate: number): number => {
+    let npv = 0;
+    for (const cf of cashFlows) {
+      const dt = (new Date(cf.date).getTime() - d0) / MS_PER_YEAR;
+      npv += cf.amount / Math.pow(1 + rate, dt);
+    }
+    return npv;
+  };
+
+  // Derivative of NPV function
+  const df = (rate: number): number => {
+    let dnpv = 0;
+    for (const cf of cashFlows) {
+      const dt = (new Date(cf.date).getTime() - d0) / MS_PER_YEAR;
+      dnpv -= (dt * cf.amount) / Math.pow(1 + rate, dt + 1);
+    }
+    return dnpv;
+  };
+
+  let rate = guess;
+  const maxIterations = 150;
+  const tolerance = 1e-6;
+
+  for (let i = 0; i < maxIterations; i++) {
+    const y = f(rate);
+    const dy = df(rate);
+
+    if (Math.abs(dy) < 1e-12) break;
+
+    const nextRate = rate - y / dy;
+
+    // Boundary guards
+    if (nextRate <= -0.999 || isNaN(nextRate) || !isFinite(nextRate)) {
+      rate = rate > 0 ? rate / 2 : 0.05;
+      continue;
+    }
+
+    if (Math.abs(nextRate - rate) < tolerance) {
+      return parseFloat((nextRate * 100).toFixed(2));
+    }
+
+    rate = nextRate;
+  }
+
+  return parseFloat((rate * 100).toFixed(2));
+}
+
 export interface StockDailyCandle {
   date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface MacroDailyCandle {
+  date: string;
+  indexName: string;
   open: number;
   high: number;
   low: number;
@@ -34,6 +116,16 @@ export interface SymbolLineageEntry {
   effectiveDate: string;
 }
 
+export function normalizeMacroIndexName(raw: string): string {
+  const s = (raw || '').trim().toUpperCase().replace(/[\^_\.]/g, ' ').replace(/\s+/g, ' ');
+  if (s.includes('VIX')) return 'INDIA VIX';
+  if (s.includes('500')) return 'NIFTY 500';
+  if (s.includes('50') && !s.includes('500')) return 'NIFTY 50';
+  if (s.includes('GOLD')) return 'GOLDBEES';
+  if (s.includes('LIQUID')) return 'LIQUIDBEES';
+  return (raw || '').trim().toUpperCase();
+}
+
 export interface InMemMarketMatrix {
   allDates: string[];
   symbols: string[];
@@ -47,6 +139,10 @@ export interface InMemMarketMatrix {
   indexHistory?: IndexReconEntry[];
   // Symbol lineage transitions
   symbolLineage?: Map<string, string>; // oldSymbol -> newSymbol
+  // Macro instruments from macro_daily (e.g. NIFTY 50, NIFTY 500, INDIA VIX, GOLDBEES, LIQUIDBEES)
+  macroData?: Map<string, Map<string, MacroDailyCandle>>;
+  macroSeries?: Map<string, MacroDailyCandle[]>;
+  macroDateIdx?: Map<string, Map<string, number>>;
 }
 
 /**
@@ -55,7 +151,8 @@ export interface InMemMarketMatrix {
 export function buildMarketMatrix(
   rows: any[],
   indexHistoryRows?: any[],
-  lineageRows?: any[]
+  lineageRows?: any[],
+  macroRows?: any[]
 ): InMemMarketMatrix {
   const datesSet = new Set<string>();
   const data = new Map<string, Map<string, StockDailyCandle>>();
@@ -86,6 +183,49 @@ export function buildMarketMatrix(
     const idx = arr.length;
     arr.push(candle);
     symbolDateIdx.get(sym)!.set(dt, idx);
+  }
+
+  // Parse Real Macro Instruments from macro_daily table (Nifty 50, Nifty 500, India VIX, GoldBeES, LiquidBeES)
+  const macroData = new Map<string, Map<string, MacroDailyCandle>>();
+  const macroSeries = new Map<string, MacroDailyCandle[]>();
+  const macroDateIdx = new Map<string, Map<string, number>>();
+
+  if (macroRows && Array.isArray(macroRows)) {
+    for (let m = 0; m < macroRows.length; m++) {
+      const mRow = macroRows[m];
+      const dt: string = Array.isArray(mRow) ? mRow[0] : mRow.trade_date || mRow.date;
+      const rawName: string = Array.isArray(mRow) ? mRow[1] : mRow.index_name || mRow.symbol;
+      const o: number = Number(Array.isArray(mRow) ? mRow[2] : mRow.open) || 0;
+      const h: number = Number(Array.isArray(mRow) ? mRow[3] : mRow.high) || o;
+      const l: number = Number(Array.isArray(mRow) ? mRow[4] : mRow.low) || o;
+      const c: number = Number(Array.isArray(mRow) ? mRow[5] : mRow.close) || o;
+      const v: number = Number(Array.isArray(mRow) ? mRow[6] : mRow.volume) || 0;
+
+      if (!dt || !rawName || isNaN(c)) continue;
+      const normName = normalizeMacroIndexName(rawName);
+
+      if (!macroData.has(normName)) {
+        macroData.set(normName, new Map());
+        macroSeries.set(normName, []);
+        macroDateIdx.set(normName, new Map());
+      }
+
+      const mCandle: MacroDailyCandle = {
+        date: dt,
+        indexName: normName,
+        open: o,
+        high: h,
+        low: l,
+        close: c,
+        volume: v,
+      };
+
+      macroData.get(normName)!.set(dt, mCandle);
+      const mArr = macroSeries.get(normName)!;
+      const mIdx = mArr.length;
+      mArr.push(mCandle);
+      macroDateIdx.get(normName)!.set(dt, mIdx);
+    }
   }
 
   const allDates = Array.from(datesSet).sort();
@@ -123,7 +263,18 @@ export function buildMarketMatrix(
     }
   }
 
-  return { allDates, symbols, data, symbolCandles, symbolDateIdx, indexHistory, symbolLineage };
+  return {
+    allDates,
+    symbols,
+    data,
+    symbolCandles,
+    symbolDateIdx,
+    indexHistory,
+    symbolLineage,
+    macroData,
+    macroSeries,
+    macroDateIdx,
+  };
 }
 
 interface ActivePosition {
@@ -148,7 +299,11 @@ export function executeRealDataBacktest(
   const startTime = performance.now();
 
   const {
+    investmentMode = 'lumpsum',
     initialCapital = 1000000,
+    sipMonthlyAmount = 25000,
+    sipDayOfMonth = 1,
+    sipAnnualStepUpPct = 0,
     portfolioSize = 10,
     maxPositionWeightPct,
     retentionBufferRank,
@@ -188,16 +343,34 @@ export function executeRealDataBacktest(
   // Build continuous daily timeline for Nifty 50, Nifty 500, 200 DMA/EMA, and India VIX
   const macroTimeline = buildMacroDailyTimeline(matrix);
 
-  let cash = initialCapital;
+  // Determine starting lump-sum capital
+  const effectiveStartCapital =
+    investmentMode === 'sip' && initialCapital === 0 ? sipMonthlyAmount : initialCapital;
+
+  let cash = effectiveStartCapital;
   const positions = new Map<string, ActivePosition>();
   const executedTrades: BacktestTrade[] = [];
   const equityPoints: EquityPoint[] = [];
 
-  let peakPortfolioEquity = initialCapital;
-  let peakBenchmarkEquity = initialCapital;
-  let benchmarkCapital = initialCapital;
-  let nifty50Capital = initialCapital;
-  let goldCapital = initialCapital;
+  let peakPortfolioEquity = effectiveStartCapital;
+  let peakBenchmarkEquity = effectiveStartCapital;
+  let benchmarkCapital = effectiveStartCapital;
+  let nifty50Capital = effectiveStartCapital;
+  let goldCapital = effectiveStartCapital;
+
+  // Tracking recurring SIP contributions and Cash Flows for XIRR
+  let totalInvestedCapital = effectiveStartCapital;
+  let totalSipContributions = 0;
+  const cashFlows: Array<{ date: string; amount: number }> = [];
+  const yearlyInflowMap = new Map<number, number>();
+
+  if (effectiveStartCapital > 0 && allDates[simStartIdx]) {
+    cashFlows.push({ date: allDates[simStartIdx], amount: -effectiveStartCapital });
+    const sYr = parseInt(allDates[simStartIdx].substring(0, 4), 10);
+    yearlyInflowMap.set(sYr, (yearlyInflowMap.get(sYr) || 0) + effectiveStartCapital);
+  }
+
+  let lastSipMonthKey = '';
 
   const lastKnownCloses = new Map<string, number>();
   const monthsProcessed = new Set<string>();
@@ -206,7 +379,7 @@ export function executeRealDataBacktest(
 
   // Track daily returns for Sharpe / Sortino calculation
   const dailyStrategyReturns: number[] = [];
-  let previousDayEquity = initialCapital;
+  let previousDayEquity = effectiveStartCapital;
 
   const totalSimDays = allDates.length - simStartIdx;
   let tradeCounter = 0;
@@ -279,13 +452,131 @@ export function executeRealDataBacktest(
 
     const dist52WHighPct = ((cNow - high52W) / high52W) * 100; // e.g. -4.5%
 
+    // 14-day Average True Range (ATR) calculation
+    let atr14 = 0;
+    let atrPct = 2.5; // fallback default
+    if (cIdx >= 14) {
+      let trSum = 0;
+      for (let k = cIdx - 13; k <= cIdx; k++) {
+        const cur = candles[k];
+        const prev = candles[k - 1];
+        const prevClose = prev ? prev.close : cur.open;
+        const tr = Math.max(
+          cur.high - cur.low,
+          Math.abs(cur.high - prevClose),
+          Math.abs(cur.low - prevClose)
+        );
+        trSum += tr;
+      }
+      atr14 = trSum / 14;
+      if (cNow > 0 && atr14 > 0) {
+        atrPct = (atr14 / cNow) * 100;
+      }
+    }
+
     return {
       symbol: sym,
       closePrice: cNow,
       momentumScore,
       high52W,
       dist52WHighPct,
+      atr14,
+      atrPct,
     };
+  };
+
+  // Helper to compute dynamic portfolio weights across top candidates
+  const computeCandidateWeights = (
+    candidates: Array<{
+      symbol: string;
+      closePrice: number;
+      momentumScore: number;
+      dist52WHighPct: number;
+      atrPct: number;
+    }>,
+    targetSize: number,
+    strategy: BacktestWeightStrategy = 'equal_weight',
+    maxCapPct?: number
+  ): Map<string, number> => {
+    const topCands = candidates.slice(0, targetSize);
+    const n = topCands.length;
+    const weightMap = new Map<string, number>();
+    if (n === 0) return weightMap;
+
+    if (strategy === 'equal_weight') {
+      const fixedSlotWeight = maxCapPct ? Math.min(maxCapPct / 100, 1 / targetSize) : 1 / targetSize;
+      topCands.forEach((c) => weightMap.set(c.symbol, fixedSlotWeight));
+      return weightMap;
+    }
+
+    const minScore = Math.min(...topCands.map((c) => c.momentumScore));
+    const maxScore = Math.max(...topCands.map((c) => c.momentumScore));
+    const scoreSpread = Math.max(0.001, maxScore - minScore);
+
+    const rawWeights: number[] = topCands.map((c, idx) => {
+      const rankNum = idx + 1;
+      const normScore = Math.max(0.05, (c.momentumScore - minScore) / scoreSpread);
+      const safeAtrPct = Math.max(0.8, c.atrPct || 2.5);
+
+      switch (strategy) {
+        case 'atr_momentum_parity':
+          // Volatility-Adjusted Momentum: Higher return / lower ATR = higher weight
+          return (normScore / safeAtrPct) * (1 / Math.sqrt(rankNum));
+        case 'atr_inverse_vol':
+          // Pure Risk Parity: Inverse ATR
+          return 1 / safeAtrPct;
+        case 'multi_factor':
+          // Multi-Factor: Score² * rank decay
+          return Math.pow(normScore, 2) * (1 / Math.sqrt(rankNum));
+        case 'composite_score':
+          // Cubic score spread
+          return Math.pow(normScore, 3);
+        case 'rank_decay':
+          // Rank power decay
+          return 1 / Math.pow(rankNum, 0.65);
+        default:
+          return 1.0;
+      }
+    });
+
+    const totalRaw = rawWeights.reduce((a, b) => a + b, 0);
+    // When portfolio is full (n >= targetSize), distribute 100% capital.
+    // If fewer than targetSize candidates qualify, scale invested capital to (n / targetSize) to preserve dry powder cash.
+    const capitalScaleFactor = Math.min(1.0, n / targetSize);
+    let normWeights = rawWeights.map((rw) => (rw / (totalRaw || 1)) * capitalScaleFactor);
+
+    // Enforce single-stock maximum position cap if specified
+    const effectiveCap = maxCapPct ? maxCapPct / 100 : Math.min(0.35, 2.0 / targetSize);
+    if (normWeights.some((w) => w > effectiveCap)) {
+      let capped = [...normWeights];
+      let isCapped = new Array(capped.length).fill(false);
+      for (let iter = 0; iter < 5; iter++) {
+        let excess = 0;
+        let uncappedSum = 0;
+        for (let i = 0; i < capped.length; i++) {
+          if (!isCapped[i] && capped[i] > effectiveCap) {
+            excess += capped[i] - effectiveCap;
+            capped[i] = effectiveCap;
+            isCapped[i] = true;
+          } else if (!isCapped[i]) {
+            uncappedSum += capped[i];
+          }
+        }
+        if (excess <= 0.0001 || uncappedSum <= 0) break;
+        for (let i = 0; i < capped.length; i++) {
+          if (!isCapped[i]) {
+            capped[i] += excess * (capped[i] / uncappedSum);
+          }
+        }
+      }
+      normWeights = capped;
+    }
+
+    topCands.forEach((c, idx) => {
+      weightMap.set(c.symbol, normWeights[idx]);
+    });
+
+    return weightMap;
   };
 
   // Helper to get top ranked momentum candidates on a specific date
@@ -295,6 +586,7 @@ export function executeRealDataBacktest(
       closePrice: number;
       momentumScore: number;
       dist52WHighPct: number;
+      atrPct: number;
     }> = [];
 
     for (let s = 0; s < symbols.length; s++) {
@@ -312,6 +604,7 @@ export function executeRealDataBacktest(
         closePrice: m.closePrice,
         momentumScore: m.momentumScore,
         dist52WHighPct: m.dist52WHighPct,
+        atrPct: m.atrPct,
       });
     }
 
@@ -320,10 +613,100 @@ export function executeRealDataBacktest(
     return scoredList;
   };
 
+  let inDefensiveCash = false;
+
+  // Defensive Yield / Cash Asset parameters
+  const defensiveAssetType = config.defensiveAssetType || 'liquid_fund';
+  let defensiveYieldAnnualPct = config.defensiveCashYieldPct;
+  if (defensiveYieldAnnualPct === undefined) {
+    if (defensiveAssetType === 'cash_zero') defensiveYieldAnnualPct = 0;
+    else if (defensiveAssetType === 'liquid_fund') defensiveYieldAnnualPct = 6.5;
+    else if (defensiveAssetType === 'fixed_deposit') defensiveYieldAnnualPct = 7.5;
+    else if (defensiveAssetType === 'gold_etf') defensiveYieldAnnualPct = 12.0;
+    else defensiveYieldAnnualPct = 6.5;
+  }
+  let totalDefensiveYieldEarned = 0;
+  let defensiveCashDaysCount = 0;
+  let sumCashExposurePct = 0;
+
   for (let i = simStartIdx; i < allDates.length; i++) {
     const currentDate = allDates[i];
     const currentYear = parseInt(currentDate.substring(0, 4), 10);
     if (currentYear > endYear) break;
+
+    // 0. Handle Recurring SIP cash ingestion
+    const dateParts = currentDate.split('-');
+    const currentYearNum = parseInt(dateParts[0], 10);
+    const currentDayNum = parseInt(dateParts[2], 10);
+    const currentMonthKey = `${dateParts[0]}-${dateParts[1]}`;
+
+    if (
+      (investmentMode === 'sip' || investmentMode === 'hybrid') &&
+      currentMonthKey !== lastSipMonthKey &&
+      currentDayNum >= sipDayOfMonth
+    ) {
+      // Annual step-up multiplier
+      const yearsElapsed = Math.max(0, currentYearNum - startYear);
+      const stepMultiplier = Math.pow(1 + (sipAnnualStepUpPct / 100), yearsElapsed);
+      const stepSipAmount = Math.round(sipMonthlyAmount * stepMultiplier);
+
+      cash += stepSipAmount;
+      benchmarkCapital += stepSipAmount;
+      nifty50Capital += stepSipAmount;
+      goldCapital += stepSipAmount;
+
+      totalInvestedCapital += stepSipAmount;
+      totalSipContributions += stepSipAmount;
+      cashFlows.push({ date: currentDate, amount: -stepSipAmount });
+      yearlyInflowMap.set(currentYearNum, (yearlyInflowMap.get(currentYearNum) || 0) + stepSipAmount);
+
+      lastSipMonthKey = currentMonthKey;
+    }
+
+    // Apply daily yield on idle cash / defensive asset allocation
+    let dailyYieldEarned = 0;
+    if (cash > 0) {
+      if (defensiveAssetType === 'gold_etf') {
+        const goldCandleNow = matrix.macroData?.get('GOLDBEES')?.get(currentDate);
+        const goldCandlePrev = i > 0 ? matrix.macroData?.get('GOLDBEES')?.get(allDates[i - 1]) : null;
+        if (goldCandleNow && goldCandlePrev && goldCandlePrev.close > 0 && goldCandleNow.close > 0) {
+          const dailyGoldReturn = (goldCandleNow.close - goldCandlePrev.close) / goldCandlePrev.close;
+          dailyYieldEarned = cash * dailyGoldReturn;
+          cash += dailyYieldEarned;
+          totalDefensiveYieldEarned += dailyYieldEarned;
+        } else if (defensiveYieldAnnualPct > 0) {
+          const dailyRate = (defensiveYieldAnnualPct / 100) / 252;
+          dailyYieldEarned = cash * dailyRate;
+          cash += dailyYieldEarned;
+          totalDefensiveYieldEarned += dailyYieldEarned;
+        }
+      } else if (defensiveAssetType === 'liquid_fund') {
+        const liquidCandleNow = matrix.macroData?.get('LIQUIDBEES')?.get(currentDate);
+        const liquidCandlePrev = i > 0 ? matrix.macroData?.get('LIQUIDBEES')?.get(allDates[i - 1]) : null;
+        if (
+          liquidCandleNow &&
+          liquidCandlePrev &&
+          liquidCandlePrev.close > 0 &&
+          liquidCandleNow.close > 0 &&
+          liquidCandleNow.close !== liquidCandlePrev.close
+        ) {
+          const dailyLiquidReturn = (liquidCandleNow.close - liquidCandlePrev.close) / liquidCandlePrev.close;
+          dailyYieldEarned = cash * dailyLiquidReturn;
+          cash += dailyYieldEarned;
+          totalDefensiveYieldEarned += dailyYieldEarned;
+        } else if (defensiveYieldAnnualPct > 0) {
+          const dailyRate = (defensiveYieldAnnualPct / 100) / 252;
+          dailyYieldEarned = cash * dailyRate;
+          cash += dailyYieldEarned;
+          totalDefensiveYieldEarned += dailyYieldEarned;
+        }
+      } else if (defensiveYieldAnnualPct > 0) {
+        const dailyRate = (defensiveYieldAnnualPct / 100) / 252;
+        dailyYieldEarned = cash * dailyRate;
+        cash += dailyYieldEarned;
+        totalDefensiveYieldEarned += dailyYieldEarned;
+      }
+    }
 
     // Progress update every ~120 trading days
     if (onProgress && (i - simStartIdx) % 120 === 0) {
@@ -346,8 +729,16 @@ export function executeRealDataBacktest(
       i,
       config.macroFilter,
       config.vixThreshold ?? 25,
-      config.circuitBreakers
+      config.circuitBreakers,
+      inDefensiveCash
     );
+
+    // Update defensive cash status
+    if (macroBreaker.isActive) {
+      inDefensiveCash = true;
+    } else {
+      inDefensiveCash = false;
+    }
 
     // If Macro Circuit Breaker is active, immediately liquidate all active positions into 100% Cash
     if (macroBreaker.isActive && positions.size > 0) {
@@ -554,7 +945,6 @@ export function executeRealDataBacktest(
     }
 
     // 3. Cadence Review & Rebalancing Logic (Only active when Macro Regime is Safe)
-    const currentMonthKey = currentDate.substring(0, 7);
     let isCadenceRebalanceDay = false;
 
     if (!macroBreaker.isActive) {
@@ -646,7 +1036,7 @@ export function executeRealDataBacktest(
         positions.delete(sym);
       }
 
-      // Calculate Total Portfolio Value for equal slot sizing
+      // Calculate Total Portfolio Value for dynamic slot sizing
       let currentInvestedValue = 0;
       positions.forEach((pos, sym) => {
         const c = lastKnownCloses.get(sym) || pos.entryPrice;
@@ -654,14 +1044,22 @@ export function executeRealDataBacktest(
       });
 
       const totalEquity = cash + currentInvestedValue;
-      const effectiveMaxWeight = maxPositionWeightPct ? maxPositionWeightPct / 100 : 1 / portfolioSize;
-      const targetSlotCapital = totalEquity * effectiveMaxWeight;
+      const weightStrategy = config.weightStrategy || 'equal_weight';
+      const weightMap = computeCandidateWeights(
+        scoredCandidates,
+        portfolioSize,
+        weightStrategy,
+        maxPositionWeightPct
+      );
 
       // Buy top momentum candidates into open portfolio slots
       for (const cand of scoredCandidates) {
         if (positions.size >= portfolioSize) break;
         if (!positions.has(cand.symbol)) {
           const cNow = lastKnownCloses.get(cand.symbol);
+          const candWeight = weightMap.get(cand.symbol) || 1 / portfolioSize;
+          const targetSlotCapital = totalEquity * candWeight;
+
           if (cNow && cNow > 0 && cash >= targetSlotCapital * 0.25) {
             const allocationAmt = Math.min(cash, targetSlotCapital);
             const shares = Math.floor(allocationAmt / (cNow * 1.0035));
@@ -691,13 +1089,21 @@ export function executeRealDataBacktest(
       });
 
       const totalEquity = cash + currentInvestedValue;
-      const effectiveMaxWeight = maxPositionWeightPct ? maxPositionWeightPct / 100 : 1 / portfolioSize;
-      const targetSlotCapital = totalEquity * effectiveMaxWeight;
+      const weightStrategy = config.weightStrategy || 'equal_weight';
+      const weightMap = computeCandidateWeights(
+        scoredCandidates,
+        portfolioSize,
+        weightStrategy,
+        maxPositionWeightPct
+      );
 
       for (const cand of scoredCandidates) {
         if (positions.size >= portfolioSize) break;
         if (!positions.has(cand.symbol)) {
           const cNow = lastKnownCloses.get(cand.symbol);
+          const candWeight = weightMap.get(cand.symbol) || 1 / portfolioSize;
+          const targetSlotCapital = totalEquity * candWeight;
+
           if (cNow && cNow > 0 && cash >= targetSlotCapital * 0.5) {
             const allocationAmt = Math.min(cash, targetSlotCapital);
             const shares = Math.floor(allocationAmt / (cNow * 1.0035));
@@ -743,16 +1149,22 @@ export function executeRealDataBacktest(
     // Calculate actual market daily return from index timeline
     let dailyMarketRet500 = yrReturnNifty500 / 25200;
     let dailyMarketRet50 = yrReturnNifty50 / 25200;
+    let dailyMarketRetGold = yrReturnGold / 25200;
     if (i > 0 && macroTimeline.nifty500[i - 1] > 0 && macroTimeline.nifty500[i] > 0) {
       dailyMarketRet500 = (macroTimeline.nifty500[i] - macroTimeline.nifty500[i - 1]) / macroTimeline.nifty500[i - 1];
     }
     if (i > 0 && macroTimeline.nifty50[i - 1] > 0 && macroTimeline.nifty50[i] > 0) {
       dailyMarketRet50 = (macroTimeline.nifty50[i] - macroTimeline.nifty50[i - 1]) / macroTimeline.nifty50[i - 1];
     }
+    const goldCandleNow = matrix.macroData?.get('GOLDBEES')?.get(currentDate);
+    const goldCandlePrev = i > 0 ? matrix.macroData?.get('GOLDBEES')?.get(allDates[i - 1]) : null;
+    if (goldCandleNow && goldCandlePrev && goldCandlePrev.close > 0 && goldCandleNow.close > 0) {
+      dailyMarketRetGold = (goldCandleNow.close - goldCandlePrev.close) / goldCandlePrev.close;
+    }
 
     benchmarkCapital *= 1 + dailyMarketRet500;
     nifty50Capital *= 1 + dailyMarketRet50;
-    goldCapital *= 1 + (yrReturnGold / 25200);
+    goldCapital *= 1 + dailyMarketRetGold;
 
     if (benchmarkCapital > peakBenchmarkEquity) {
       peakBenchmarkEquity = benchmarkCapital;
@@ -768,6 +1180,14 @@ export function executeRealDataBacktest(
     dailyStrategyReturns.push(dailyRet);
     previousDayEquity = currentStrategyEquity;
 
+    const cashPct = currentStrategyEquity > 0 ? (cash / currentStrategyEquity) * 100 : 0;
+    const equityPct = currentStrategyEquity > 0 ? (investedStockValue / currentStrategyEquity) * 100 : 0;
+    sumCashExposurePct += cashPct;
+
+    if (macroBreaker.isActive || positions.size === 0) {
+      defensiveCashDaysCount++;
+    }
+
     equityPoints.push({
       date: currentDate,
       year: currentYear,
@@ -777,6 +1197,12 @@ export function executeRealDataBacktest(
       goldEquity: parseFloat(goldCapital.toFixed(2)),
       strategyDrawdown: parseFloat(strategyDrawdown.toFixed(2)),
       benchmarkDrawdown: parseFloat(benchmarkDrawdown.toFixed(2)),
+      cumulativeInvested: parseFloat(totalInvestedCapital.toFixed(2)),
+      cashPct: parseFloat(cashPct.toFixed(1)),
+      equityPct: parseFloat(equityPct.toFixed(1)),
+      cashAmount: parseFloat(cash.toFixed(2)),
+      isDefensiveMode: macroBreaker.isActive,
+      defensiveYieldToday: parseFloat(dailyYieldEarned.toFixed(2)),
     });
   }
 
@@ -807,19 +1233,48 @@ export function executeRealDataBacktest(
     });
   }
 
-  const finalStrategyCapital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].strategyEquity : initialCapital;
-  const finalBenchmarkCapital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].benchmarkEquity : initialCapital;
-  const finalNifty50Capital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].nifty50Equity : initialCapital;
-  const finalGoldCapital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].goldEquity : initialCapital;
+  const finalStrategyCapital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].strategyEquity : effectiveStartCapital;
+  const finalBenchmarkCapital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].benchmarkEquity : effectiveStartCapital;
+  const finalNifty50Capital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].nifty50Equity : effectiveStartCapital;
+  const finalGoldCapital = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].goldEquity : effectiveStartCapital;
+  const finalDate = equityPoints.length > 0 ? equityPoints[equityPoints.length - 1].date : allDates[allDates.length - 1];
+
+  // Calculate terminal cash flows for XIRR
+  const stratCashFlows = [...cashFlows, { date: finalDate, amount: finalStrategyCapital }];
+  const benchCashFlows = [...cashFlows, { date: finalDate, amount: finalBenchmarkCapital }];
+  const nifty50CashFlows = [...cashFlows, { date: finalDate, amount: finalNifty50Capital }];
+  const goldCashFlows = [...cashFlows, { date: finalDate, amount: finalGoldCapital }];
+
+  const strategyXirr = calculateXIRR(stratCashFlows);
+  const benchmarkXirr = calculateXIRR(benchCashFlows);
+  const nifty50Xirr = calculateXIRR(nifty50CashFlows);
+  const goldXirr = calculateXIRR(goldCashFlows);
 
   const totalYears = Math.max(0.5, equityPoints.length / 252);
-  const strategyCagr = ((Math.max(0.01, finalStrategyCapital) / initialCapital) ** (1 / totalYears) - 1) * 100;
-  const benchmarkCagr = ((Math.max(0.01, finalBenchmarkCapital) / initialCapital) ** (1 / totalYears) - 1) * 100;
-  const nifty50Cagr = ((Math.max(0.01, finalNifty50Capital) / initialCapital) ** (1 / totalYears) - 1) * 100;
-  const goldCagr = ((Math.max(0.01, finalGoldCapital) / initialCapital) ** (1 / totalYears) - 1) * 100;
+  let strategyCagr: number;
+  let benchmarkCagr: number;
+  let nifty50Cagr: number;
+  let goldCagr: number;
 
-  const strategyTotalReturn = ((finalStrategyCapital - initialCapital) / initialCapital) * 100;
-  const benchmarkTotalReturn = ((finalBenchmarkCapital - initialCapital) / initialCapital) * 100;
+  if (investmentMode === 'sip' || investmentMode === 'hybrid') {
+    strategyCagr = strategyXirr;
+    benchmarkCagr = benchmarkXirr;
+    nifty50Cagr = nifty50Xirr;
+    goldCagr = goldXirr;
+  } else {
+    strategyCagr = ((Math.max(0.01, finalStrategyCapital) / Math.max(1, effectiveStartCapital)) ** (1 / totalYears) - 1) * 100;
+    benchmarkCagr = ((Math.max(0.01, finalBenchmarkCapital) / Math.max(1, effectiveStartCapital)) ** (1 / totalYears) - 1) * 100;
+    nifty50Cagr = ((Math.max(0.01, finalNifty50Capital) / Math.max(1, effectiveStartCapital)) ** (1 / totalYears) - 1) * 100;
+    goldCagr = ((Math.max(0.01, finalGoldCapital) / Math.max(1, effectiveStartCapital)) ** (1 / totalYears) - 1) * 100;
+  }
+
+  const strategyTotalReturn = ((finalStrategyCapital - totalInvestedCapital) / Math.max(1, totalInvestedCapital)) * 100;
+  const benchmarkTotalReturn = ((finalBenchmarkCapital - totalInvestedCapital) / Math.max(1, totalInvestedCapital)) * 100;
+
+  const strategyMoic = parseFloat((finalStrategyCapital / Math.max(1, totalInvestedCapital)).toFixed(2));
+  const benchmarkMoic = parseFloat((finalBenchmarkCapital / Math.max(1, totalInvestedCapital)).toFixed(2));
+  const nifty50Moic = parseFloat((finalNifty50Capital / Math.max(1, totalInvestedCapital)).toFixed(2));
+  const goldMoic = parseFloat((finalGoldCapital / Math.max(1, totalInvestedCapital)).toFixed(2));
 
   let maxDrawdownStrategy = 0;
   let maxDrawdownBenchmark = 0;
@@ -904,9 +1359,27 @@ export function executeRealDataBacktest(
     }
   });
 
+  let runningCumulativeInvested = 0;
   yearsMap.forEach((val, yr) => {
-    const stratRet = ((val.endEquity - val.startEquity) / val.startEquity) * 100;
-    const benchRet = ((val.benchEnd - val.benchStart) / val.benchStart) * 100;
+    const yrInflow = yearlyInflowMap.get(yr) || 0;
+    runningCumulativeInvested += yrInflow;
+    let stratRet: number;
+    let benchRet: number;
+
+    if (investmentMode === 'sip' || investmentMode === 'hybrid') {
+      // Modified Dietz method for intra-year recurring flows
+      const stratGain = val.endEquity - val.startEquity - yrInflow;
+      const stratBase = val.startEquity + yrInflow / 2;
+      stratRet = stratBase > 0 ? (stratGain / stratBase) * 100 : 0;
+
+      const benchGain = val.benchEnd - val.benchStart - yrInflow;
+      const benchBase = val.benchStart + yrInflow / 2;
+      benchRet = benchBase > 0 ? (benchGain / benchBase) * 100 : 0;
+    } else {
+      stratRet = ((val.endEquity - val.startEquity) / Math.max(1, val.startEquity)) * 100;
+      benchRet = ((val.benchEnd - val.benchStart) / Math.max(1, val.benchStart)) * 100;
+    }
+
     yearlyPerformance.push({
       year: yr,
       strategyReturn: parseFloat(stratRet.toFixed(2)),
@@ -915,12 +1388,18 @@ export function executeRealDataBacktest(
       maxDrawdown: parseFloat(val.minDrawdown.toFixed(2)),
       tradesCount: val.trades,
       winRate: val.trades > 0 ? parseFloat(((val.wins / val.trades) * 100).toFixed(1)) : 0,
+      yearlyInflow: yrInflow,
+      cumulativeInvested: runningCumulativeInvested,
+      endStrategyCapital: parseFloat(val.endEquity.toFixed(2)),
     });
   });
 
   return {
     config,
-    initialCapital,
+    investmentMode,
+    initialCapital: effectiveStartCapital,
+    totalInvestedCapital: parseFloat(totalInvestedCapital.toFixed(2)),
+    totalSipContributions: parseFloat(totalSipContributions.toFixed(2)),
     finalStrategyCapital: parseFloat(finalStrategyCapital.toFixed(2)),
     finalBenchmarkCapital: parseFloat(finalBenchmarkCapital.toFixed(2)),
     finalNifty50Capital: parseFloat(finalNifty50Capital.toFixed(2)),
@@ -929,8 +1408,16 @@ export function executeRealDataBacktest(
     benchmarkCagr: parseFloat(benchmarkCagr.toFixed(2)),
     nifty50Cagr: parseFloat(nifty50Cagr.toFixed(2)),
     goldCagr: parseFloat(goldCagr.toFixed(2)),
+    strategyXirr: parseFloat(strategyXirr.toFixed(2)),
+    benchmarkXirr: parseFloat(benchmarkXirr.toFixed(2)),
+    nifty50Xirr: parseFloat(nifty50Xirr.toFixed(2)),
+    goldXirr: parseFloat(goldXirr.toFixed(2)),
     strategyTotalReturn: parseFloat(strategyTotalReturn.toFixed(2)),
     benchmarkTotalReturn: parseFloat(benchmarkTotalReturn.toFixed(2)),
+    strategyMoic,
+    benchmarkMoic,
+    nifty50Moic,
+    goldMoic,
     strategyMaxDrawdown: parseFloat(maxDrawdownStrategy.toFixed(2)),
     benchmarkMaxDrawdown: parseFloat(maxDrawdownBenchmark.toFixed(2)),
     sharpeRatio: parseFloat(sharpeRatio.toFixed(2)),
@@ -944,6 +1431,12 @@ export function executeRealDataBacktest(
     avgLossPct: parseFloat(avgLossPct.toFixed(2)),
     avgHoldingDays: Math.round(avgHoldingDays),
     annualTurnoverPct: Math.round((totalTradesCount / totalYears) * (100 / portfolioSize)),
+    defensiveCashDays: defensiveCashDaysCount,
+    defensiveCashPct: equityPoints.length > 0 ? parseFloat(((defensiveCashDaysCount / equityPoints.length) * 100).toFixed(1)) : 0,
+    avgCashExposurePct: equityPoints.length > 0 ? parseFloat((sumCashExposurePct / equityPoints.length).toFixed(1)) : 0,
+    totalDefensiveYieldEarned: Math.round(totalDefensiveYieldEarned),
+    defensiveAssetType,
+    defensiveCashYieldPct: defensiveYieldAnnualPct,
     yearlyPerformance,
     equityCurve: equityPoints,
     sampleTrades: executedTrades.sort((a, b) => (a.exitDate < b.exitDate ? 1 : -1)),

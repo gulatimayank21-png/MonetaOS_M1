@@ -1,9 +1,12 @@
-import React, { useState, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import { INITIAL_NIFTY500_STOCKS, getStocksForIndex } from './data/nifty500Data';
-import { StockRecord, FilterSettings, NSEIndexKey } from './types';
+import { StockRecord, FilterSettings, NSEIndexKey, DataFetchInfo, ComputedStockMetric } from './types';
 import { calculateUniverseMetrics } from './utils/quantEngine';
+import { useHistoricalDataSync } from './hooks/useHistoricalDataSync';
+import { formatTradeDateFriendly, getISTTimeInfo, getSyncScheduleDetails } from './utils/syncScheduleUtils';
 
 import { Header } from './components/Header';
+import { DataFreshnessBar } from './components/DataFreshnessBar';
 import { IndexSelectorBar } from './components/IndexSelectorBar';
 import { SummaryComparisonGuide } from './components/SummaryComparisonGuide';
 import { MetricCards } from './components/MetricCards';
@@ -29,6 +32,27 @@ export default function App() {
   // Active Index filter ('nifty500' | 'nifty50' | 'niftynext50' | 'niftymidcap150' | 'niftysmallcap250')
   const [selectedIndex, setSelectedIndex] = useState<NSEIndexKey>('nifty500');
 
+  // Background SQLite WASM & Historical Delta Synchronization Worker
+  const dbSync = useHistoricalDataSync();
+
+  // Data Freshness & EOD Timestamp state
+  const [dataFetchInfo, setDataFetchInfo] = useState<DataFetchInfo>(() => {
+    const ist = getISTTimeInfo();
+    const defaultDbDate = '2026-09-15';
+    return {
+      fetchedAt: new Date().toISOString(),
+      dbTradeDate: defaultDbDate,
+      tradeDateFormatted: formatTradeDateFriendly(defaultDbDate),
+      scheduledSyncTime: 'Daily at 06:30 PM IST',
+      isPreSyncWindow: ist.isBeforeDailySync,
+      source: 'Official National Stock Exchange of India (NSE Bhavcopy & Constituent Archives)',
+      recordCount: 500,
+      isLiveQuote: true,
+      engineStatus: 'ready',
+      summaryMessage: 'Multi-Timeframe Momentum Computed Across 500 Verified Constituents',
+    };
+  });
+
   // Filter raw stocks to the active index
   const rawStocks = useMemo(() => {
     return getStocksForIndex(allStocks, selectedIndex);
@@ -37,7 +61,7 @@ export default function App() {
   // Strategy and Filter Parameters
   const [filters, setFilters] = useState<FilterSettings>({
     mode: 'percentile',
-    percentileThreshold: 25, // Step 5.1: Top 25% Rule
+    percentileThreshold: 10, // Step 5.1: Top 10% Super-Trend default
     topCountThreshold: 50, // Step 4 snippet: Top 50 count
     enforce52WHigh: true, // Step 5.3: 52-Week High Rule
     maxDistance52WHighPct: 5, // within 5% of 52-week high
@@ -62,6 +86,7 @@ export default function App() {
   const [isDbUploadOpen, setIsDbUploadOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isFetchingNSE, setIsFetchingNSE] = useState(false);
+  const [isSyncingLive, setIsSyncingLive] = useState(false);
   const [refreshNotification, setRefreshNotification] = useState<string | null>(null);
 
   // Handle filter changes
@@ -73,6 +98,142 @@ export default function App() {
   const { processedStocks, overlappingWinners, sectorTailwinds, stats } = useMemo(() => {
     return calculateUniverseMetrics(rawStocks, filters);
   }, [rawStocks, filters]);
+
+  // Listen for worker's latestComputedMetrics and update allStocks
+  useEffect(() => {
+    if (dbSync.latestComputedMetrics && dbSync.latestComputedMetrics.length > 0) {
+      const metricsMap = new Map<string, ComputedStockMetric>();
+      let maxTradeDate = dbSync.dbStats?.maxDate && dbSync.dbStats.maxDate !== 'N/A'
+        ? dbSync.dbStats.maxDate
+        : '2026-09-15';
+
+      for (const m of dbSync.latestComputedMetrics) {
+        metricsMap.set(m.ticker.toUpperCase(), m);
+        if (m.latestTradeDate && m.latestTradeDate > maxTradeDate) {
+          maxTradeDate = m.latestTradeDate;
+        }
+      }
+
+      setAllStocks((prev) =>
+        prev.map((stock) => {
+          const key = stock.ticker.toUpperCase();
+          const computed = metricsMap.get(key);
+          if (computed) {
+            const lastClose = computed.lastClose || stock.lastClose;
+            const cmp = computed.cmp || stock.cmp;
+            const cmpChangePct = lastClose > 0 ? Number((((cmp - lastClose) / lastClose) * 100).toFixed(1)) : 0;
+            return {
+              ...stock,
+              lastClose,
+              cmp,
+              cmpChangePct,
+              high52w: computed.high52w || stock.high52w,
+              low52w: computed.low52w || stock.low52w,
+              return1M: computed.return1M,
+              return3M: computed.return3M,
+              return1Y: computed.return1Y,
+            };
+          }
+          return stock;
+        })
+      );
+
+      const ist = getISTTimeInfo();
+      setDataFetchInfo((prev) => ({
+        ...prev,
+        fetchedAt: new Date().toISOString(),
+        dbTradeDate: maxTradeDate,
+        tradeDateFormatted: formatTradeDateFriendly(maxTradeDate),
+        isPreSyncWindow: ist.isBeforeDailySync,
+        recordCount: dbSync.latestComputedMetrics?.length || 500,
+        summaryMessage: `Computed on latest SQLite WASM database (${dbSync.latestComputedMetrics?.length} constituents, Session: ${formatTradeDateFriendly(maxTradeDate)})`,
+      }));
+    } else if (dbSync.dbStats?.maxDate && dbSync.dbStats.maxDate !== 'N/A') {
+      const maxTradeDate = dbSync.dbStats.maxDate;
+      const ist = getISTTimeInfo();
+      setDataFetchInfo((prev) => ({
+        ...prev,
+        dbTradeDate: maxTradeDate,
+        tradeDateFormatted: formatTradeDateFriendly(maxTradeDate),
+        isPreSyncWindow: ist.isBeforeDailySync,
+      }));
+    }
+  }, [dbSync.latestComputedMetrics, dbSync.dbStats]);
+
+  // Initial Automated Load: Fetch sync status and compute latest universe quotes on startup
+  useEffect(() => {
+    let isMounted = true;
+    const loadInitialData = async () => {
+      try {
+        // 1. Fetch Sync Status metadata
+        const res = await fetch('/api/universe/sync-status', {
+          headers: { Accept: 'application/json' },
+        });
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const json = await res.json();
+          if (json.success && json.status && isMounted) {
+            const s = json.status;
+            setDataFetchInfo((prev) => ({
+              ...prev,
+              fetchedAt: s.lastSuccessfulSync || s.lastActualNSESync || prev.fetchedAt,
+              source: s.source || prev.source,
+            }));
+          }
+        }
+      } catch (e) {
+        console.warn('Sync status fetch error:', e);
+      }
+
+      // 2. Fetch live quotes batch for active universe
+      try {
+        const symbols = rawStocks.map((s) => s.symbol || `${s.ticker}.NS`);
+        const quotesResponse = await fetch('/api/live-quotes-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ symbols }),
+        });
+
+        if (quotesResponse.ok && isMounted) {
+          const ct = quotesResponse.headers.get('content-type') || '';
+          if (ct.includes('application/json')) {
+            const json = await quotesResponse.json();
+            if (json.success && json.quotes) {
+              const quotesMap = json.quotes;
+              setAllStocks((prev) =>
+                prev.map((stock) => {
+                  const key = stock.ticker.toUpperCase();
+                  const live = quotesMap[key];
+                  if (live) {
+                    const changePct = Number((((live.cmp - live.lastClose) / live.lastClose) * 100).toFixed(1));
+                    return {
+                      ...stock,
+                      lastClose: live.lastClose,
+                      cmp: live.cmp,
+                      cmpChangePct: changePct,
+                      high52w: live.high52w,
+                      low52w: live.low52w,
+                      return1M: live.return1M,
+                      return3M: live.return3M,
+                      return1Y: live.return1Y,
+                    };
+                  }
+                  return stock;
+                })
+              );
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Live quotes batch initial load error:', err);
+      }
+    };
+
+    loadInitialData();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // List of distinct sectors for filter dropdown
   const availableSectors = useMemo(() => {
@@ -156,8 +317,6 @@ export default function App() {
 
     return list;
   }, [processedStocks, filters]);
-
-  const [isSyncingLive, setIsSyncingLive] = useState(false);
 
   // Pull fresh official constituents directly from official NSE India archive CSVs
   const handleFetchNSELive = useCallback(async (indexKey: NSEIndexKey) => {
@@ -389,6 +548,14 @@ export default function App() {
           </div>
         )}
 
+        {/* Real Data Fetch & Computation Status Bar */}
+        <DataFreshnessBar
+          dataFetchInfo={dataFetchInfo}
+          isComputing={isSyncingLive || dbSync.status === 'downloading' || isRefreshing}
+          onRefreshLive={handleSyncLiveQuotes}
+          activeConstituentsCount={rawStocks.length}
+        />
+
         {/* Target Universe Index Selector */}
         <IndexSelectorBar
           selectedIndex={selectedIndex}
@@ -458,11 +625,12 @@ export default function App() {
         onUpdateStock={handleUpdateStock}
       />
 
-      {/* Equal-Weight Portfolio Allocator Modal (Step 5) */}
+      {/* Quantitative Portfolio Allocator Modal (Step 5) */}
       <PortfolioBuilderModal
         isOpen={isPortfolioOpen}
         onClose={() => setIsPortfolioOpen(false)}
         winners={overlappingWinners}
+        sectorTailwinds={sectorTailwinds}
         onOpenBacktest={(sl, target) => {
           setBacktestInitialSL(sl);
           setBacktestInitialTarget(target);

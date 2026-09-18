@@ -43,6 +43,8 @@ export interface StockRecord {
   pctFrom52WHigh?: number; // e.g. -3.2%
   isWithin52WHigh?: boolean;
   isOverlappingWinner?: boolean; // Meets criteria across all 3 timeframes
+  atr14?: number; // 14-day Average True Range in INR
+  atrPct?: number; // 14-day ATR as % of Close Price
   
   // Rebalance Status
   rebalanceStatus?: 'retained' | 'new_entrant' | 'slipped_exit' | 'neutral';
@@ -53,6 +55,35 @@ export interface StockRecord {
   isin?: string; // Standard unique security identifier (e.g. "INE758T01015")
   corporateActionNote?: string; // e.g. "Renamed from ZOMATO", "Split adjusted 10:1"
   crossSourceVerified?: boolean; // Verified against secondary quote source
+}
+
+export interface ComputedStockMetric {
+  symbol: string;
+  ticker: string;
+  lastClose: number;
+  cmp: number;
+  cmpChangePct?: number;
+  high52w: number;
+  low52w: number;
+  return1M: number;
+  return3M: number;
+  return1Y: number;
+  previousReturn1M?: number;
+  previousReturn3M?: number;
+  latestTradeDate?: string;
+}
+
+export interface DataFetchInfo {
+  fetchedAt: string; // ISO string of when sync / data was fetched
+  dbTradeDate: string; // The verified latest trade date found in the database (e.g. "2026-09-15")
+  tradeDateFormatted: string; // Formatted date string (e.g. "Tuesday, 15 Sep 2026")
+  scheduledSyncTime: string; // e.g. "Daily at 06:30 PM IST"
+  isPreSyncWindow: boolean; // True if current time is before 6:30 PM IST on a trading day
+  source: string; // e.g. "Official National Stock Exchange of India (NSE Bhavcopy & Archives)"
+  recordCount: number;
+  isLiveQuote: boolean;
+  engineStatus: 'ready' | 'computing' | 'cached';
+  summaryMessage?: string;
 }
 
 export interface NightlySyncStatus {
@@ -111,14 +142,28 @@ export interface FilterSettings {
 export interface SectorTailwindInfo {
   sector: string;
   overlappingCount: number;
+  baselineWinnerCount?: number;
+  sectorBreadthPct?: number;
   totalInSector: number;
   percentageOfOverlapping: number;
-  isTailwind: boolean; // >= 4 or >= 20% of winners
+  isTailwind: boolean; // Structural macro sector tailwind (universe momentum breadth or active concentration)
 }
+
+export type PortfolioWeightStrategy =
+  | 'atr_momentum_parity' // ATR-Adjusted Momentum (Score / ATR% ★)
+  | 'multi_factor' // Multi-Factor Conviction: Composite Score + Rank Decay + Tailwind Boost (Recommended)
+  | 'atr_inverse_vol' // ATR Inverse Volatility (Pure Risk Parity)
+  | 'composite_score' // Proportional to Composite Score
+  | 'rank_decay' // Inverse / Exponential Rank Decay
+  | 'tailwind_tilted' // Overweight stocks in Tailwind Sectors
+  | 'equal_weight'; // 1/N Baseline Equal Weight
 
 export interface PortfolioAllocation {
   totalCapital: number;
   topNStocks: number;
+  weightStrategy?: PortfolioWeightStrategy;
+  maxPositionWeightPct?: number; // Cap per single stock (e.g. 20%)
+  tailwindBoostPct?: number; // e.g. 25% extra weight for tailwind sectors
   stopLossPct: number;
   targetGainPct: number;
 }
@@ -131,6 +176,8 @@ export interface AllocatedPosition {
   investedAmount: number;
   stopLossPrice: number;
   targetPrice: number;
+  convictionTier?: 'High Alpha' | 'Core Momentum' | 'Emerging Trend';
+  hasTailwindBoost?: boolean;
 }
 
 export type RebalanceCadence =
@@ -166,6 +213,7 @@ export interface CircuitBreakersConfig {
     enabled: boolean;
     indicator: '50_EMA' | '50_DMA' | '200_DMA';
     thresholdPct: number; // e.g. 45% (sit in cash if % of Nifty 500 stocks above MA < thresholdPct)
+    reEntryThresholdPct?: number; // e.g. 40%, 45%, 50%, 55% (stay in cash until % above MA >= reEntryThresholdPct)
   };
   rapidDrawdown: {
     enabled: boolean;
@@ -183,11 +231,30 @@ export type StopLossMode =
 
 export type TrailingStopRule = StopLossMode;
 
+export type BacktestWeightStrategy =
+  | 'equal_weight' // Equal weight (1/N Baseline)
+  | 'atr_momentum_parity' // ATR-Adjusted Momentum (Score / ATR% ★)
+  | 'atr_inverse_vol' // ATR Inverse Volatility (Pure Risk Parity)
+  | 'multi_factor' // Multi-Factor: Score² / sqrt(Rank)
+  | 'composite_score' // Proportional to Composite Score³
+  | 'rank_decay'; // Inverse Rank Decay (1 / Rank^0.65)
+
+export type InvestmentMode = 'lumpsum' | 'sip' | 'hybrid';
+
+export type DefensiveAssetOption = 'cash_zero' | 'liquid_fund' | 'fixed_deposit' | 'gold_etf' | 'custom';
+
 export interface BacktestConfig {
+  investmentMode?: InvestmentMode;
   initialCapital: number;
+  sipMonthlyAmount?: number; // e.g. 15000, 25000, 50000
+  sipDayOfMonth?: number; // e.g. 1, 5, 10, 15, 20, 25
+  sipAnnualStepUpPct?: number; // e.g. 0, 5, 10, 15, 20 (% annual increase)
   portfolioSize: number;
+  weightStrategy?: BacktestWeightStrategy;
   maxPositionWeightPct?: number; // e.g. 10%, 15%, 20%, 25%, 33.3%, 50%
   retentionBufferRank?: number; // e.g. 10 (Strict/No Buffer), 15, 20, 25, 30, 40
+  defensiveAssetType?: DefensiveAssetOption; // 'cash_zero' | 'liquid_fund' | 'fixed_deposit' | 'gold_etf' | 'custom'
+  defensiveCashYieldPct?: number; // e.g. 0%, 6.5% (Liquid/Arbitrage), 7.5% (FD), 12.0% (Gold ETF), or custom %
   stopLossMode?: StopLossMode;
   stopLossPct: number;
   targetGainPct: number;
@@ -210,6 +277,9 @@ export interface YearPerformance {
   maxDrawdown: number;
   tradesCount: number;
   winRate: number;
+  yearlyInflow?: number;
+  cumulativeInvested?: number;
+  endStrategyCapital?: number;
 }
 
 export interface EquityPoint {
@@ -221,6 +291,12 @@ export interface EquityPoint {
   goldEquity: number;
   strategyDrawdown: number;
   benchmarkDrawdown: number;
+  cumulativeInvested?: number;
+  cashPct?: number; // % in Cash / Defensive Asset
+  equityPct?: number; // % in Equity
+  cashAmount?: number; // ₹ cash balance
+  isDefensiveMode?: boolean; // whether macro breaker is active
+  defensiveYieldToday?: number; // yield earned on cash today
 }
 
 export interface BacktestTrade {
@@ -250,7 +326,10 @@ export interface BacktestTrade {
 
 export interface BacktestSummary {
   config: BacktestConfig;
+  investmentMode: InvestmentMode;
   initialCapital: number;
+  totalInvestedCapital: number;
+  totalSipContributions: number;
   finalStrategyCapital: number;
   finalBenchmarkCapital: number;
   finalNifty50Capital: number;
@@ -259,8 +338,16 @@ export interface BacktestSummary {
   benchmarkCagr: number;
   nifty50Cagr: number;
   goldCagr: number;
+  strategyXirr?: number;
+  benchmarkXirr?: number;
+  nifty50Xirr?: number;
+  goldXirr?: number;
   strategyTotalReturn: number;
   benchmarkTotalReturn: number;
+  strategyMoic: number;
+  benchmarkMoic: number;
+  nifty50Moic: number;
+  goldMoic: number;
   strategyMaxDrawdown: number;
   benchmarkMaxDrawdown: number;
   sharpeRatio: number;
@@ -274,6 +361,12 @@ export interface BacktestSummary {
   avgLossPct: number;
   avgHoldingDays: number;
   annualTurnoverPct: number;
+  defensiveCashDays?: number; // number of days spent in defensive cash mode
+  defensiveCashPct?: number; // % of total days in defensive cash
+  avgCashExposurePct?: number; // average portfolio % in cash
+  totalDefensiveYieldEarned?: number; // total ₹ yield generated by idle cash
+  defensiveAssetType?: string;
+  defensiveCashYieldPct?: number;
   yearlyPerformance: YearPerformance[];
   equityCurve: EquityPoint[];
   sampleTrades: BacktestTrade[];

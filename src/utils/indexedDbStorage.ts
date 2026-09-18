@@ -6,7 +6,7 @@
  * and server-side binary mounts.
  */
 
-import { APP_DB_VERSION, STORAGE_VERSION_KEY } from '../constants/database';
+import { APP_DB_VERSION, STORAGE_VERSION_KEY, LEGACY_STORAGE_VERSION_KEY } from '../constants/database';
 
 const DB_NAME = 'MonetaHistoricalDB';
 const STORE_NAME = 'sqlite_store';
@@ -213,7 +213,10 @@ export async function hasValidDatabase(expectedVersion: string = APP_DB_VERSION)
 export function getStoredDbVersion(): string | null {
   try {
     if (typeof localStorage !== 'undefined') {
-      return localStorage.getItem(STORAGE_VERSION_KEY);
+      return (
+        localStorage.getItem(STORAGE_VERSION_KEY) ||
+        localStorage.getItem(LEGACY_STORAGE_VERSION_KEY)
+      );
     }
   } catch (_) {}
   return null;
@@ -226,6 +229,7 @@ export function setStoredDbVersion(version: string = APP_DB_VERSION): void {
   try {
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(STORAGE_VERSION_KEY, version);
+      localStorage.setItem(LEGACY_STORAGE_VERSION_KEY, version);
     }
   } catch (_) {}
 }
@@ -237,6 +241,7 @@ export async function clearDatabase(): Promise<void> {
   try {
     if (typeof localStorage !== 'undefined') {
       localStorage.removeItem(STORAGE_VERSION_KEY);
+      localStorage.removeItem(LEGACY_STORAGE_VERSION_KEY);
     }
   } catch (_) {}
 

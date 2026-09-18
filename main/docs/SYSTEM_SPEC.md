@@ -33,21 +33,14 @@ $$\text{Score} = (0.20 \times \text{Percentile}_{1M}) + (0.35 \times \text{Perce
 ### 2.4 Multi-Factor Portfolio Sizing & ATR Volatility Weighting Models
 To overcome the naive limitations of equal weighting ($1/N$) and mitigate portfolio drawdowns during momentum exhaustion phases, the quant engine and backtest simulator support dynamic, volatility-adjusted position weighting strategies:
 
-#### Why ATR (Average True Range) is a Vital Factor:
-High-momentum breakouts often exhibit elevated historical volatility and sudden tail whipsaws. Incorporating 14-day ATR% ($\text{ATR}_{14} / \text{Close}$) normalizes the risk contribution across high-beta momentum runners and smooth secular compounders:
-- **Smooth Compounders** (low ATR%, high score) receive higher capital allocations due to steady trend persistence and minimal drawdown drag.
-- **Volatile Runners** (high ATR%, high score) receive calibrated position sizes to prevent idiosyncratic whipsaws from damaging portfolio NAV.
-
 #### Supported Strategies:
 1. **ATR-Adjusted Momentum Parity (Recommended ★)**:
    $$\text{RawWeight}_i = \frac{(\text{Score}_i / 100)^{1.5}}{\max(0.8\%, \text{ATR\%}_i)} \times \frac{1}{\sqrt{\text{Rank}_i}} \times \text{TailwindMultiplier}_i$$
    Balances raw momentum leadership with normalized volatility risk and sector tailwinds.
 2. **ATR Inverse Volatility (Pure Risk Parity)**:
    $$\text{RawWeight}_i = \frac{1}{\max(0.8\%, \text{ATR\%}_i)}$$
-   Equalizes the dollar risk contribution across all portfolio constituents.
 3. **Multi-Factor Conviction Weighted**:
    $$\text{RawWeight}_i = \left(\frac{\text{Score}_i}{100}\right)^2 \times \frac{1}{\sqrt{\text{Rank}_i}} \times \text{TailwindMultiplier}_i$$
-   where $\text{TailwindMultiplier}_i = 1.25$ (+25% boost) if in an active institutional Tailwind sector.
 4. **Composite Score Weighted ($S_i^3$)**: Sizes positions strictly by the cubic spread of normalized composite scores.
 5. **Rank-Decay Tiered ($1/\text{Rank}^{0.65}$)**:
    - **Formula**:
@@ -134,7 +127,7 @@ To eliminate cash drag during macro circuit breaker lockouts (100% Cash) or open
 - **`StockTable.tsx`**: High-density interactive universe view with multi-timeframe sorting, visual momentum badges, 52W proximity indicators, and Sector Tailwind tags.
 - **`QuantFilters.tsx`**: Filter controls for percentile thresholds, absolute counts, 52W high proximity tolerance, and sector isolation.
 - **`MetricCards.tsx`**: Top-level quant statistics summarizing overlapping count, average returns across timeframes, and dominant sector tailwind.
-- **`BacktestSimulatorModal.tsx`**: Multi-year historical simulation engine calculating CAGR, Sharpe ratio, Max Drawdown, monthly returns heatmap, live Web Worker simulation execution, and trade transaction logs with clean real-data controls.
+- **`BacktestSimulatorModal.tsx`**: Multi-year historical simulation engine calculating CAGR, XIRR, MOIC, Sharpe ratio, Max Drawdown, monthly returns heatmap, live Web Worker simulation execution, and trade transaction logs with clean real-data controls.
 - **`PortfolioBuilderModal.tsx`**: Equal-weight / risk-parity portfolio constructor with rebalancing rules and export capabilities.
 
 ---

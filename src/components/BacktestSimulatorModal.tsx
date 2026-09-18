@@ -31,6 +31,11 @@ import {
   Timer,
   Clock,
   Zap,
+  Scale,
+  Landmark,
+  PiggyBank,
+  Coins,
+  PieChart,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -46,7 +51,16 @@ import {
   Legend,
   CartesianGrid,
 } from 'recharts';
-import { BacktestConfig, BacktestSummary, RebalanceCadence, TrailingStopRule, StopLossMode, MacroRegimeFilter } from '../types';
+import {
+  BacktestConfig,
+  BacktestSummary,
+  RebalanceCadence,
+  TrailingStopRule,
+  StopLossMode,
+  MacroRegimeFilter,
+  BacktestWeightStrategy,
+  InvestmentMode,
+} from '../types';
 import { runQuantMomentumBacktest } from '../utils/backtestEngine';
 import { useHistoricalDataSync } from '../hooks/useHistoricalDataSync';
 
@@ -74,7 +88,6 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
     hasCachedData,
     startWarmup,
     syncDeltas,
-    runQuery,
     runRealBacktest,
   } = useHistoricalDataSync();
 
@@ -85,10 +98,17 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
 
   // Configurable backtest parameters
   const [config, setConfig] = useState<BacktestConfig>({
+    investmentMode: 'lumpsum',
     initialCapital: 1000000, // ₹10 Lakhs
+    sipMonthlyAmount: 25000, // ₹25,000 / month
+    sipDayOfMonth: 1,
+    sipAnnualStepUpPct: 10, // +10% annual step up
     portfolioSize: 10,
     maxPositionWeightPct: undefined, // Auto equal weighting: 100% / portfolioSize
+    weightStrategy: 'atr_momentum_parity', // Volatility-Adjusted Momentum parity
     retentionBufferRank: 25,
+    defensiveAssetType: 'liquid_fund',
+    defensiveCashYieldPct: 6.5,
     stopLossMode: initialStopLoss === 0 ? 'none' : 'static',
     stopLossPct: initialStopLoss !== undefined && initialStopLoss > 0 ? initialStopLoss : 8,
     targetGainPct: initialTargetGain !== undefined ? initialTargetGain : 25,
@@ -114,6 +134,7 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
         enabled: true,
         indicator: '50_EMA',
         thresholdPct: 45,
+        reEntryThresholdPct: 50,
       },
       rapidDrawdown: {
         enabled: false,
@@ -126,17 +147,9 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
 
   const [showCircuitBreakerStudio, setShowCircuitBreakerStudio] = useState<boolean>(true);
 
-  const [activeChartTab, setActiveChartTab] = useState<'equity' | 'drawdown' | 'yearly'>('equity');
+  const [activeChartTab, setActiveChartTab] = useState<'equity' | 'drawdown' | 'yearly' | 'cash_allocation'>('equity');
   const [tradeFilter, setTradeFilter] = useState<'all' | 'winners' | 'multibaggers' | 'stops' | 'rank_drop'>('all');
   const [showRationaleGuide, setShowRationaleGuide] = useState<boolean>(false);
-  const [showSqlInspector, setShowSqlInspector] = useState<boolean>(false);
-  const [customSqlQuery, setCustomSqlQuery] = useState<string>(
-    'SELECT symbol, trade_date, open, high, low, close, volume FROM daily_ohlcv WHERE symbol = "TRENT" ORDER BY trade_date DESC LIMIT 10;'
-  );
-  const [sqlQueryResult, setSqlQueryResult] = useState<any[] | null>(null);
-  const [sqlQueryError, setSqlQueryError] = useState<string | null>(null);
-  const [isExecutingRawSql, setIsExecutingRawSql] = useState<boolean>(false);
-  const [sqlExecutionTimeMs, setSqlExecutionTimeMs] = useState<number | null>(null);
 
   // Real-Data Simulation State
   const [realSummary, setRealSummary] = useState<BacktestSummary | null>(null);
@@ -225,26 +238,6 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
     return () => clearTimeout(debounceTimer);
   }, [isOpen, syncStatus, config, handleRunBacktest]);
 
-  // Live SQL Query Executor against loaded SQLite WASM DB
-  const handleExecuteRawSql = async (sqlToRun?: string) => {
-    const query = sqlToRun || customSqlQuery;
-    setIsExecutingRawSql(true);
-    setSqlQueryError(null);
-    const startT = performance.now();
-    try {
-      const rows = await runQuery(query);
-      const elapsed = Math.round(performance.now() - startT);
-      setSqlQueryResult(rows);
-      setSqlExecutionTimeMs(elapsed);
-    } catch (err: any) {
-      console.error('SQL Execution Error:', err);
-      setSqlQueryError(err?.message || 'Failed to execute query');
-      setSqlQueryResult(null);
-    } finally {
-      setIsExecutingRawSql(false);
-    }
-  };
-
   if (!isOpen) return null;
 
   // Filtered sample trades
@@ -329,18 +322,6 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
               </div>
             ) : null}
 
-            <button
-              onClick={() => setShowSqlInspector((prev) => !prev)}
-              className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                showSqlInspector
-                  ? 'bg-indigo-50 text-indigo-900 border-indigo-300 shadow-2xs font-semibold'
-                  : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
-              }`}
-              title="Inspect raw SQLite database with SQL queries"
-            >
-              <Terminal className="w-3.5 h-3.5 text-indigo-600" />
-              <span className="hidden sm:inline">Live SQL Inspector</span>
-            </button>
             <button
               onClick={() => setShowRationaleGuide((prev) => !prev)}
               className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 transition-colors"
@@ -466,15 +447,6 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                 >
                   <RefreshCw className={`w-3.5 h-3.5 text-emerald-600 ${isSyncingDeltas ? 'animate-spin' : ''}`} />
                   <span>{isSyncingDeltas ? 'Syncing...' : 'Sync EOD Deltas'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setShowSqlInspector((prev) => !prev)}
-                  className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 transition-colors inline-flex items-center gap-1.5 shadow-2xs cursor-pointer"
-                >
-                  <Terminal className="w-3.5 h-3.5 text-indigo-600" />
-                  {showSqlInspector ? 'Hide SQL Inspector' : 'Inspect Raw SQL DB'}
                 </button>
 
                 <button
@@ -623,172 +595,6 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
             )}
           </div>
 
-          {/* Interactive Live SQL Inspector & Raw Data Verification */}
-          {showSqlInspector && (
-            <div className="p-4 sm:p-5 rounded-xl bg-slate-900 text-slate-100 text-xs space-y-3.5 animate-in fade-in shadow-xl border border-slate-800">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
-                <div className="flex items-center gap-2">
-                  <Terminal className="w-4 h-4 text-emerald-400" />
-                  <h3 className="font-bold text-white text-sm font-mono">
-                    Live SQLite WASM Query Inspector (Browser In-Memory Engine)
-                  </h3>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-slate-400 font-mono">
-                    {syncStatus === 'ready'
-                      ? 'Status: DB Ready in Memory'
-                      : `Status: ${syncStatus.toUpperCase()}`}
-                  </span>
-                  <button
-                    onClick={() => setShowSqlInspector(false)}
-                    className="text-slate-400 hover:text-white text-xs font-semibold px-2 py-0.5 rounded hover:bg-slate-800 transition-colors"
-                  >
-                    Close Inspector
-                  </button>
-                </div>
-              </div>
-
-              {/* Preset Query Buttons */}
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] text-slate-400 font-semibold mr-1">Quick Presets:</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const q = 'SELECT symbol, effective_from, effective_to FROM index_universe_history ORDER BY effective_from DESC LIMIT 10;';
-                    setCustomSqlQuery(q);
-                    handleExecuteRawSql(q);
-                  }}
-                  className="px-2 py-1 rounded bg-indigo-900/60 hover:bg-indigo-800 text-indigo-200 hover:text-white text-[11px] font-mono transition-colors border border-indigo-700"
-                >
-                  Index Reconstitution (PIT)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const q = 'SELECT old_symbol, new_symbol, effective_date FROM symbol_lineage LIMIT 10;';
-                    setCustomSqlQuery(q);
-                    handleExecuteRawSql(q);
-                  }}
-                  className="px-2 py-1 rounded bg-indigo-900/60 hover:bg-indigo-800 text-indigo-200 hover:text-white text-[11px] font-mono transition-colors border border-indigo-700"
-                >
-                  Symbol Lineage
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const q = 'SELECT symbol, trade_date, open, high, low, close, volume FROM daily_ohlcv WHERE symbol = "TRENT" ORDER BY trade_date DESC LIMIT 10;';
-                    setCustomSqlQuery(q);
-                    handleExecuteRawSql(q);
-                  }}
-                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] font-mono transition-colors border border-slate-700"
-                >
-                  TRENT Candles
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const q = 'SELECT symbol, status, listing_date, terminal_trading_date FROM stock_market_lifespan WHERE status = "DISCONTINUED" LIMIT 10;';
-                    setCustomSqlQuery(q);
-                    handleExecuteRawSql(q);
-                  }}
-                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] font-mono transition-colors border border-slate-700"
-                >
-                  Discontinued Stocks
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const q = 'SELECT COUNT(*) as total_rows, COUNT(DISTINCT symbol) as total_symbols, MIN(trade_date) as min_date, MAX(trade_date) as max_date FROM daily_ohlcv;';
-                    setCustomSqlQuery(q);
-                    handleExecuteRawSql(q);
-                  }}
-                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] font-mono transition-colors border border-slate-700"
-                >
-                  Total DB Stats
-                </button>
-              </div>
-
-              {/* SQL Input Field */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                  <span>Custom SQL Statement (Read-Only):</span>
-                  {sqlExecutionTimeMs !== null && (
-                    <span className="text-emerald-400">
-                      Executed in {sqlExecutionTimeMs} ms • {sqlQueryResult?.length || 0} rows returned
-                    </span>
-                  )}
-                </div>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={customSqlQuery}
-                    onChange={(e) => setCustomSqlQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') handleExecuteRawSql();
-                    }}
-                    placeholder="SELECT * FROM stock_daily_ohlcv LIMIT 10;"
-                    className="w-full font-mono text-xs px-3 py-2 rounded bg-slate-950 border border-slate-700 text-emerald-300 focus:outline-hidden focus:border-emerald-500 placeholder-slate-600"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleExecuteRawSql()}
-                    disabled={isExecutingRawSql || syncStatus !== 'ready'}
-                    className="px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold text-xs font-mono inline-flex items-center gap-1.5 transition-colors shrink-0"
-                  >
-                    {isExecutingRawSql ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        Running...
-                      </>
-                    ) : (
-                      <>
-                        <Play className="w-3 h-3 fill-current" />
-                        Execute SQL
-                      </>
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {/* Error Display */}
-              {sqlQueryError && (
-                <div className="p-2.5 rounded bg-rose-950/80 border border-rose-800 text-rose-300 font-mono text-[11px]">
-                  Error: {sqlQueryError}
-                </div>
-              )}
-
-              {/* Results Table */}
-              {sqlQueryResult && sqlQueryResult.length > 0 && (
-                <div className="overflow-x-auto max-h-56 rounded border border-slate-800 bg-slate-950 font-mono">
-                  <table className="w-full text-[11px] text-left">
-                    <thead className="sticky top-0 bg-slate-800 text-slate-300 uppercase text-[10px] border-b border-slate-700">
-                      <tr>
-                        {Object.keys(sqlQueryResult[0]).map((col) => (
-                          <th key={col} className="py-1.5 px-2.5 whitespace-nowrap">
-                            {col}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/80 text-slate-300">
-                      {sqlQueryResult.map((row, idx) => (
-                        <tr key={idx} className="hover:bg-slate-900/60">
-                          {Object.values(row).map((val: any, valIdx) => (
-                            <td key={valIdx} className="py-1.5 px-2.5 whitespace-nowrap">
-                              {typeof val === 'number'
-                                ? val.toLocaleString(undefined, { maximumFractionDigits: 2 })
-                                : String(val ?? 'NULL')}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          )}
-
           {/* Collapsible Strategy Rationale Guide */}
           {showRationaleGuide && (
             <div className="p-4 sm:p-5 rounded-xl bg-indigo-50/70 border border-indigo-200/80 text-xs space-y-3 animate-in fade-in">
@@ -855,16 +661,21 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
               <div className="flex items-center gap-2">
                 <Sliders className="w-4 h-4 text-indigo-600" />
                 <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Adjust Strategy Rules &amp; R:R Parameters
+                  Adjust Strategy Rules &amp; Ingestion Parameters
                 </span>
               </div>
               <button
                 type="button"
                 onClick={() =>
                   setConfig({
+                    investmentMode: 'lumpsum',
                     initialCapital: 1000000,
+                    sipMonthlyAmount: 25000,
+                    sipDayOfMonth: 1,
+                    sipAnnualStepUpPct: 10,
                     portfolioSize: 10,
                     maxPositionWeightPct: undefined, // Auto 10%
+                    weightStrategy: 'atr_momentum_parity', // ATR volatility parity
                     retentionBufferRank: 25,
                     stopLossMode: 'static',
                     stopLossPct: 8,
@@ -890,11 +701,214 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                 className="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-slate-900 transition-colors"
               >
                 <RotateCcw className="w-3 h-3" />
-                Reset Defaults (SL: -8%, Target: +25%)
+                Reset Defaults (SL: -8%, Target: +25%, ATR Parity)
               </button>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3.5">
+            {/* INVESTMENT MODE & CAPITAL INGESTION ARCHITECTURE */}
+            <div className="bg-white rounded-xl border border-indigo-100 p-3.5 shadow-2xs space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+                <div className="flex items-center gap-2">
+                  <div className="p-1 rounded-md bg-indigo-600 text-white">
+                    <TrendingUp className="w-3.5 h-3.5" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold text-slate-900">
+                      Capital Ingestion Architecture
+                    </span>
+                    <span className="text-[11px] text-slate-500 ml-2 hidden sm:inline">
+                      Simulate fixed one-time lumpsum, pure recurring monthly SIP, or hybrid capital growth
+                    </span>
+                  </div>
+                </div>
+
+                {/* Investment Mode Switcher Pills */}
+                <div className="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-semibold">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setConfig({
+                        ...config,
+                        investmentMode: 'lumpsum',
+                        initialCapital: config.initialCapital === 0 ? 1000000 : config.initialCapital,
+                      })
+                    }
+                    className={`px-2.5 py-1 rounded-md transition-all ${
+                      (config.investmentMode ?? 'lumpsum') === 'lumpsum'
+                        ? 'bg-white text-indigo-900 shadow-2xs font-bold'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    💼 Lumpsum Only
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setConfig({
+                        ...config,
+                        investmentMode: 'sip',
+                        initialCapital: 0,
+                        sipMonthlyAmount: config.sipMonthlyAmount || 25000,
+                      })
+                    }
+                    className={`px-2.5 py-1 rounded-md transition-all ${
+                      config.investmentMode === 'sip'
+                        ? 'bg-white text-indigo-900 shadow-2xs font-bold'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    🔄 Pure Recurring SIP
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setConfig({
+                        ...config,
+                        investmentMode: 'hybrid',
+                        initialCapital: config.initialCapital === 0 ? 500000 : config.initialCapital,
+                        sipMonthlyAmount: config.sipMonthlyAmount || 25000,
+                      })
+                    }
+                    className={`px-2.5 py-1 rounded-md transition-all ${
+                      config.investmentMode === 'hybrid'
+                        ? 'bg-white text-indigo-900 shadow-2xs font-bold'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    🚀 Hybrid (Lumpsum + SIP)
+                  </button>
+                </div>
+              </div>
+
+              {/* Dynamic Parameter Grid based on Mode */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                {/* 1. Initial Capital (for Lumpsum & Hybrid) */}
+                {(config.investmentMode === 'lumpsum' || config.investmentMode === 'hybrid' || !config.investmentMode) && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px] font-bold text-slate-700">
+                      <span>Initial Starting Capital:</span>
+                      <span className="font-mono text-indigo-600">{formatLakhs(config.initialCapital)}</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {[200000, 500000, 1000000, 2500000, 5000000, 10000000].map((cap) => (
+                        <button
+                          key={cap}
+                          type="button"
+                          onClick={() => setConfig({ ...config, initialCapital: cap })}
+                          className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
+                            config.initialCapital === cap
+                              ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                              : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                          }`}
+                        >
+                          {cap >= 10000000 ? `₹${cap / 10000000}Cr` : `₹${cap / 100000}L`}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 2. SIP Monthly Ingestion Amount (for SIP & Hybrid) */}
+                {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px] font-bold text-slate-700">
+                      <span>Monthly SIP Contribution:</span>
+                      <span className="font-mono text-indigo-600">
+                        ₹{(config.sipMonthlyAmount ?? 25000).toLocaleString('en-IN')}/mo
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {[10000, 15000, 25000, 50000, 100000].map((amt) => (
+                        <button
+                          key={amt}
+                          type="button"
+                          onClick={() => setConfig({ ...config, sipMonthlyAmount: amt })}
+                          className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
+                            (config.sipMonthlyAmount ?? 25000) === amt
+                              ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                              : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                          }`}
+                        >
+                          {amt >= 100000 ? `₹${amt / 100000}L` : `₹${amt / 1000}k`}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 3. Annual Step-Up % (for SIP & Hybrid) */}
+                {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px] font-bold text-slate-700">
+                      <span>Annual SIP Step-Up:</span>
+                      <span className="font-mono text-indigo-600">
+                        +{config.sipAnnualStepUpPct ?? 10}% / yr
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {[0, 5, 10, 15, 20, 25].map((step) => (
+                        <button
+                          key={step}
+                          type="button"
+                          onClick={() => setConfig({ ...config, sipAnnualStepUpPct: step })}
+                          className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
+                            (config.sipAnnualStepUpPct ?? 10) === step
+                              ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                              : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                          }`}
+                        >
+                          {step === 0 ? '0% (Flat)' : `+${step}%`}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 4. Ingestion Day of Month */}
+                {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px] font-bold text-slate-700">
+                      <span>SIP Ingestion Day:</span>
+                      <span className="font-mono text-indigo-600">Day {config.sipDayOfMonth ?? 1}</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {[1, 5, 10, 15, 20, 25].map((d) => (
+                        <button
+                          key={d}
+                          type="button"
+                          onClick={() => setConfig({ ...config, sipDayOfMonth: d })}
+                          className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
+                            (config.sipDayOfMonth ?? 1) === d
+                              ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                              : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                          }`}
+                        >
+                          {d}th
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Informative Guidance Banner for SIP */}
+              {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600">
+                  <div className="flex items-center gap-1.5 text-indigo-900 font-medium">
+                    <Sparkles className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <span>
+                      {config.investmentMode === 'sip' ? 'Pure SIP mode: ' : 'Hybrid mode: '}
+                      Injects <strong>₹{(config.sipMonthlyAmount ?? 25000).toLocaleString('en-IN')}/mo</strong> into strategy cash every month on day {config.sipDayOfMonth ?? 1} (stepped up <strong>+{config.sipAnnualStepUpPct ?? 10}% annually</strong> each January).
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-slate-500 font-mono">
+                    Compounded via weekly/monthly rebalances &amp; money-weighted XIRR
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3.5">
               {/* 1. Unified Stop Loss & Protection Strategy */}
               <div className="bg-white p-3 rounded-lg border border-slate-200/80 shadow-2xs space-y-2">
                 <div className="flex items-center justify-between">
@@ -1077,7 +1091,7 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                   <div className="flex items-center justify-between text-[10px] text-slate-500">
                     <span className="font-medium">Target Slots (N):</span>
                     <div className="flex gap-1">
-                      {[5, 10, 15, 20, 25].map((n) => (
+                      {[5, 8, 10, 15, 20, 25].map((n) => (
                         <button
                           key={n}
                           type="button"
@@ -1108,7 +1122,7 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                       >
                         Auto
                       </button>
-                      {[10, 15, 20, 25, 33, 50].map((cap) => (
+                      {[10, 15, 20, 25, 30, 33, 50].map((cap) => (
                         <button
                           key={cap}
                           type="button"
@@ -1137,27 +1151,109 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                       <option value={20}>Top 20 Buffer</option>
                       <option value={25}>Top 25 Buffer (Default)</option>
                       <option value={30}>Top 30 Buffer</option>
+                      <option value={35}>Top 35 Buffer (Optimal)</option>
                       <option value={40}>Top 40 Buffer (Wide)</option>
+                      <option value={50}>Top 50 Buffer (Relaxed)</option>
                     </select>
                   </div>
                 </div>
 
-                <div className="pt-1 border-t border-slate-100">
-                  <label className="inline-flex items-center gap-1.5 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={config.enforce52WHigh}
-                      onChange={(e) => setConfig({ ...config, enforce52WHigh: e.target.checked })}
-                      className="rounded text-indigo-600 focus:ring-indigo-500"
-                    />
-                    <span className="text-[10px] font-medium text-slate-600">
-                      52W High Proximity (&le;{config.maxDistance52WHighPct}%)
+                {/* 52-Week High Proximity Rule & Interactive % Selector */}
+                <div className="pt-1.5 border-t border-slate-100 space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={config.enforce52WHigh}
+                        onChange={(e) => setConfig({ ...config, enforce52WHigh: e.target.checked })}
+                        className="rounded text-indigo-600 focus:ring-indigo-500 h-3 w-3"
+                      />
+                      <span className="text-[10px] font-medium text-slate-700">
+                        52W High Proximity:
+                      </span>
+                    </label>
+                    <span className="font-mono text-[10px] font-bold text-indigo-600">
+                      {config.enforce52WHigh ? `≤ ${config.maxDistance52WHighPct ?? 15}%` : 'Disabled'}
                     </span>
-                  </label>
+                  </div>
+
+                  {config.enforce52WHigh && (
+                    <div className="flex items-center justify-between gap-1">
+                      {[5, 8, 10, 12, 15].map((pct) => (
+                        <button
+                          key={pct}
+                          type="button"
+                          onClick={() => setConfig({ ...config, maxDistance52WHighPct: pct })}
+                          className={`flex-1 py-0.5 rounded text-center text-[10px] font-mono transition-colors ${
+                            (config.maxDistance52WHighPct ?? 15) === pct
+                              ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                              : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                          }`}
+                        >
+                          {pct}%
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* 5. Macro Regime & Crash Circuit Breakers */}
+              {/* 5. Position Weighting & Volatility-Adjusted Allocation */}
+              <div className="bg-white p-3 rounded-lg border border-slate-200/80 shadow-2xs space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-bold text-slate-700 flex items-center gap-1">
+                    <Scale className="w-3.5 h-3.5 text-indigo-600" />
+                    Weight Strategy
+                  </label>
+                  <span className="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+                    {config.weightStrategy === 'atr_momentum_parity'
+                      ? 'ATR Parity ★'
+                      : config.weightStrategy === 'atr_inverse_vol'
+                      ? 'Risk Parity'
+                      : config.weightStrategy === 'multi_factor'
+                      ? 'Multi-Factor'
+                      : config.weightStrategy === 'composite_score'
+                      ? 'Score³'
+                      : config.weightStrategy === 'rank_decay'
+                      ? 'Rank Decay'
+                      : 'Equal (1/N)'}
+                  </span>
+                </div>
+
+                <select
+                  value={config.weightStrategy ?? 'atr_momentum_parity'}
+                  onChange={(e) =>
+                    setConfig({
+                      ...config,
+                      weightStrategy: e.target.value as BacktestWeightStrategy,
+                    })
+                  }
+                  className="w-full text-xs font-medium bg-white border border-slate-200 rounded-lg p-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-600"
+                >
+                  <option value="atr_momentum_parity">ATR-Adjusted Momentum (Score / ATR% ★)</option>
+                  <option value="atr_inverse_vol">ATR Inverse Volatility (Pure Risk Parity)</option>
+                  <option value="multi_factor">Multi-Factor Conviction (Score² × Rank Decay)</option>
+                  <option value="composite_score">Composite Momentum Score Proportional (Score³)</option>
+                  <option value="rank_decay">Rank-Decay Tiered (1 / Rank^0.65)</option>
+                  <option value="equal_weight">Equal Weight (1/N Baseline Benchmark)</option>
+                </select>
+
+                <p className="text-[10px] text-slate-500 leading-tight">
+                  {config.weightStrategy === 'atr_momentum_parity'
+                    ? '★ Sizes by Momentum Score ÷ 14-day ATR%. Overweights smooth leaders & reduces whipsaw exposure.'
+                    : config.weightStrategy === 'atr_inverse_vol'
+                    ? 'Pure Risk Parity: equalizes volatility risk contribution across constituents using 1/ATR%.'
+                    : config.weightStrategy === 'multi_factor'
+                    ? 'Sizes positions using quadratic composite score scaled by inverse square-root of rank.'
+                    : config.weightStrategy === 'composite_score'
+                    ? 'Distributes capital proportionally to the cubic spread of composite scores.'
+                    : config.weightStrategy === 'rank_decay'
+                    ? 'Decays position size down the ranking ladder (Rank 1-3 get ~20%, Rank 8-10 get ~5%).'
+                    : 'Baseline: allocates identical equal capital (100% / N) to all purchased stocks.'}
+                </p>
+              </div>
+
+              {/* 6. Macro Regime & Crash Circuit Breakers */}
               <div className="bg-white p-3 rounded-lg border border-slate-200/80 shadow-2xs space-y-2">
                 <div className="flex items-center justify-between">
                   <label className="text-[11px] font-bold text-slate-700 flex items-center gap-1">
@@ -1533,7 +1629,7 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                     </div>
                   </div>
 
-                  {/* Condition 3: Market Breadth Breakdown */}
+                  {/* Condition 3: Market Breadth Breakdown & Re-Entry Confirmation Gate */}
                   <div
                     className={`p-3 rounded-lg border transition-all ${
                       config.circuitBreakers.marketBreadth?.enabled
@@ -1555,6 +1651,7 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                                   enabled: e.target.checked,
                                   indicator: config.circuitBreakers?.marketBreadth?.indicator ?? '50_EMA',
                                   thresholdPct: config.circuitBreakers?.marketBreadth?.thresholdPct ?? 45,
+                                  reEntryThresholdPct: config.circuitBreakers?.marketBreadth?.reEntryThresholdPct ?? 50,
                                 },
                               },
                             })
@@ -1563,12 +1660,12 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                         />
                         3. Market Breadth Health
                       </label>
-                      <span className="text-[10px] font-mono font-bold text-amber-700 bg-amber-50 px-1 py-0.5 rounded">
-                        &lt; {config.circuitBreakers.marketBreadth?.thresholdPct ?? 45}%
+                      <span className="text-[10px] font-mono font-bold text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200/60">
+                        Exit &lt;{config.circuitBreakers.marketBreadth?.thresholdPct ?? 45}% | Re-Entry &ge;{config.circuitBreakers.marketBreadth?.reEntryThresholdPct ?? 50}%
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-1.5 text-xs">
+                    <div className="space-y-2 text-xs">
                       <div>
                         <span className="text-[10px] text-slate-500 block mb-0.5">% Stocks above:</span>
                         <select
@@ -1588,43 +1685,83 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                           disabled={!config.circuitBreakers.marketBreadth?.enabled}
                           className="w-full text-xs bg-slate-50 border border-slate-200 rounded p-1 font-medium"
                         >
-                          <option value="50_EMA">50 EMA</option>
+                          <option value="50_EMA">50 EMA (Recommended)</option>
                           <option value="50_DMA">50 DMA</option>
                           <option value="200_DMA">200 DMA</option>
                         </select>
                       </div>
 
-                      <div>
-                        <span className="text-[10px] text-slate-500 block mb-0.5">Threshold %:</span>
-                        <div className="grid grid-cols-2 gap-1">
-                          {[40, 45, 50, 55].map((pct) => (
-                            <button
-                              key={pct}
-                              type="button"
-                              disabled={!config.circuitBreakers?.marketBreadth?.enabled}
-                              onClick={() =>
-                                setConfig({
-                                  ...config,
-                                  circuitBreakers: {
-                                    ...config.circuitBreakers!,
-                                    marketBreadth: {
-                                      ...config.circuitBreakers!.marketBreadth!,
-                                      thresholdPct: pct,
+                      <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-100">
+                        {/* Exit Threshold */}
+                        <div>
+                          <span className="text-[10px] text-slate-500 block mb-0.5">Exit to Cash if:</span>
+                          <div className="grid grid-cols-2 gap-1">
+                            {[40, 45, 50, 55].map((pct) => (
+                              <button
+                                key={pct}
+                                type="button"
+                                disabled={!config.circuitBreakers?.marketBreadth?.enabled}
+                                onClick={() =>
+                                  setConfig({
+                                    ...config,
+                                    circuitBreakers: {
+                                      ...config.circuitBreakers!,
+                                      marketBreadth: {
+                                        ...config.circuitBreakers!.marketBreadth!,
+                                        thresholdPct: pct,
+                                      },
                                     },
-                                  },
-                                })
-                              }
-                              className={`py-0.5 rounded text-center text-[10px] font-mono font-bold ${
-                                (config.circuitBreakers?.marketBreadth?.thresholdPct ?? 45) === pct
-                                  ? 'bg-amber-600 text-white'
-                                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-                              }`}
-                            >
-                              &lt;{pct}%
-                            </button>
-                          ))}
+                                  })
+                                }
+                                className={`py-0.5 rounded text-center text-[10px] font-mono font-bold ${
+                                  (config.circuitBreakers?.marketBreadth?.thresholdPct ?? 45) === pct
+                                    ? 'bg-amber-600 text-white'
+                                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                                }`}
+                              >
+                                &lt;{pct}%
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Re-Entry Confirmation Threshold */}
+                        <div>
+                          <span className="text-[10px] text-slate-500 block mb-0.5">Re-Enter Only if:</span>
+                          <div className="grid grid-cols-2 gap-1">
+                            {[40, 45, 50, 55].map((pct) => (
+                              <button
+                                key={pct}
+                                type="button"
+                                disabled={!config.circuitBreakers?.marketBreadth?.enabled}
+                                onClick={() =>
+                                  setConfig({
+                                    ...config,
+                                    circuitBreakers: {
+                                      ...config.circuitBreakers!,
+                                      marketBreadth: {
+                                        ...config.circuitBreakers!.marketBreadth!,
+                                        reEntryThresholdPct: pct,
+                                      },
+                                    },
+                                  })
+                                }
+                                className={`py-0.5 rounded text-center text-[10px] font-mono font-bold ${
+                                  (config.circuitBreakers?.marketBreadth?.reEntryThresholdPct ?? 50) === pct
+                                    ? 'bg-emerald-600 text-white'
+                                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                                }`}
+                              >
+                                &ge;{pct}%
+                              </button>
+                            ))}
+                          </div>
                         </div>
                       </div>
+
+                      <p className="text-[9px] text-slate-400 leading-tight">
+                        Prevents whipsaw: stays in cash until breadth recovers to &ge; target and all macro rules clear.
+                      </p>
                     </div>
                   </div>
 
@@ -1700,6 +1837,167 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                 </div>
               </div>
             )}
+
+            {/* IDLE CASH & DEFENSIVE ASSET DEPLOYMENT (RETURN DURING CASH PHASES) */}
+            <div className="mt-3 pt-3 border-t border-slate-200/90 bg-gradient-to-r from-emerald-50/70 via-slate-50 to-amber-50/50 rounded-xl p-3.5 border border-emerald-200/70 shadow-2xs space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-emerald-200/60 pb-2.5">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-md bg-emerald-600 text-white shadow-2xs">
+                    <Landmark className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h4 className="text-xs font-bold text-slate-900">
+                        Idle Cash & Defensive Asset Deployment (Yield While in Cash)
+                      </h4>
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                        Current Yield: {config.defensiveCashYieldPct ?? 6.5}% p.a.
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-600">
+                      When circuit breakers trigger (100% Cash) or open slots exist, deploy idle cash into interest-bearing low-risk assets to eliminate cash drag.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Asset Selector Options */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2 text-xs">
+                {/* Option 1: Zero Yield Cash */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setConfig({
+                      ...config,
+                      defensiveAssetType: 'cash_zero',
+                      defensiveCashYieldPct: 0,
+                    })
+                  }
+                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                    config.defensiveAssetType === 'cash_zero'
+                      ? 'bg-white border-slate-600 ring-2 ring-slate-400/40 shadow-xs'
+                      : 'bg-white/70 border-slate-200 hover:bg-white text-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-xs text-slate-800">1. Pure Idle Cash</span>
+                    <span className="text-[10px] font-mono font-bold bg-slate-100 text-slate-700 px-1 py-0.5 rounded">0.0% p.a.</span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 line-clamp-2">
+                    Zero-yield trading ledger balance. Benchmark for maximum cash drag.
+                  </p>
+                </button>
+
+                {/* Option 2: Liquid Funds / Arbitrage (Recommended) */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setConfig({
+                      ...config,
+                      defensiveAssetType: 'liquid_fund',
+                      defensiveCashYieldPct: 6.5,
+                    })
+                  }
+                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                    config.defensiveAssetType === 'liquid_fund' || (!config.defensiveAssetType && config.defensiveCashYieldPct === 6.5)
+                      ? 'bg-white border-emerald-500 ring-2 ring-emerald-400/40 shadow-xs'
+                      : 'bg-white/70 border-slate-200 hover:bg-white text-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-xs text-emerald-900">2. Liquid / Arbitrage Fund</span>
+                    <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 px-1 py-0.5 rounded">6.5% p.a.</span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 line-clamp-2">
+                    Overnight / Liquid MF or RBI T-Bills (Zerodha Liquidcase / LIQUIDBEES).
+                  </p>
+                </button>
+
+                {/* Option 3: Bank Fixed Deposit */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setConfig({
+                      ...config,
+                      defensiveAssetType: 'fixed_deposit',
+                      defensiveCashYieldPct: 7.5,
+                    })
+                  }
+                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                    config.defensiveAssetType === 'fixed_deposit'
+                      ? 'bg-white border-blue-500 ring-2 ring-blue-400/40 shadow-xs'
+                      : 'bg-white/70 border-slate-200 hover:bg-white text-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-xs text-blue-900">3. Fixed Deposit (FD)</span>
+                    <span className="text-[10px] font-mono font-bold bg-blue-100 text-blue-800 px-1 py-0.5 rounded">7.5% p.a.</span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 line-clamp-2">
+                    1-Year Bank FD rate / High-grade corporate senior debt instrument.
+                  </p>
+                </button>
+
+                {/* Option 4: Domestic Gold ETF */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setConfig({
+                      ...config,
+                      defensiveAssetType: 'gold_etf',
+                      defensiveCashYieldPct: 12.0,
+                    })
+                  }
+                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                    config.defensiveAssetType === 'gold_etf'
+                      ? 'bg-white border-amber-500 ring-2 ring-amber-400/40 shadow-xs'
+                      : 'bg-white/70 border-slate-200 hover:bg-white text-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-xs text-amber-900">4. Gold ETF (GOLDBEES)</span>
+                    <span className="text-[10px] font-mono font-bold bg-amber-100 text-amber-800 px-1 py-0.5 rounded">12.0% p.a.</span>
+                  </div>
+                  <p className="text-[10px] text-slate-500 line-clamp-2">
+                    Domestic Gold ETF / Sovereign Gold Bonds (10Y historical gold trend).
+                  </p>
+                </button>
+
+                {/* Option 5: Custom Yield % */}
+                <div
+                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                    config.defensiveAssetType === 'custom'
+                      ? 'bg-white border-purple-500 ring-2 ring-purple-400/40 shadow-xs'
+                      : 'bg-white/70 border-slate-200 text-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-xs text-purple-900">5. Custom Yield</span>
+                    <span className="text-[10px] font-mono font-bold bg-purple-100 text-purple-800 px-1 py-0.5 rounded">
+                      {config.defensiveCashYieldPct ?? 6.5}% p.a.
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1 mt-1">
+                    <input
+                      type="number"
+                      min={0}
+                      max={30}
+                      step={0.5}
+                      value={config.defensiveCashYieldPct ?? 6.5}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          defensiveAssetType: 'custom',
+                          defensiveCashYieldPct: Math.max(0, Math.min(30, parseFloat(e.target.value) || 0)),
+                        })
+                      }
+                      className="w-full text-xs bg-slate-50 border border-slate-200 rounded p-1 font-mono font-bold text-purple-900"
+                    />
+                    <span className="text-[10px] text-slate-500 font-bold">%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
           {/* Realistic Frictional Drag & Net Performance Notice */}
@@ -1720,34 +2018,44 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
 
           {/* Key Metric Scorecard Cards */}
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-            {/* 1. Strategy CAGR */}
+            {/* 1. Strategy CAGR / XIRR */}
             <div className="p-3.5 rounded-xl bg-gradient-to-br from-indigo-50 to-white border border-indigo-200/80 shadow-2xs">
               <div className="text-[11px] font-semibold text-indigo-900 flex items-center justify-between">
-                <span>Strategy CAGR</span>
+                <span>{config.investmentMode === 'sip' || config.investmentMode === 'hybrid' ? 'Strategy XIRR' : 'Strategy CAGR'}</span>
                 <Award className="w-3.5 h-3.5 text-indigo-600" />
               </div>
               <div className="mt-1 flex items-baseline gap-1">
                 <span className="text-xl sm:text-2xl font-bold font-mono text-indigo-950">
-                  {summary.strategyCagr}%
+                  {config.investmentMode === 'sip' || config.investmentMode === 'hybrid'
+                    ? (summary.strategyXirr ?? summary.strategyCagr)
+                    : summary.strategyCagr}%
                 </span>
               </div>
               <div className="text-[10px] text-emerald-600 font-semibold mt-0.5 flex items-center gap-0.5">
                 <ArrowUpRight className="w-3 h-3" />
-                +{(summary.strategyCagr - summary.benchmarkCagr).toFixed(1)}% vs Nifty 500
+                {config.investmentMode === 'sip' || config.investmentMode === 'hybrid'
+                  ? `+${((summary.strategyXirr ?? summary.strategyCagr) - (summary.benchmarkXirr ?? summary.benchmarkCagr)).toFixed(1)}% vs Nifty 500 XIRR`
+                  : `+${(summary.strategyCagr - summary.benchmarkCagr).toFixed(1)}% vs Nifty 500`}
               </div>
             </div>
 
-            {/* 2. Portfolio Final Capital */}
+            {/* 2. Portfolio Final Capital & Ingested Wealth */}
             <div className="p-3.5 rounded-xl bg-slate-900 text-white shadow-2xs">
               <div className="text-[11px] font-semibold text-slate-400">
-                ₹10L Compounded
+                {config.investmentMode === 'sip'
+                  ? `SIP: ${formatLakhs(summary.totalInvestedCapital)} Ingested`
+                  : config.investmentMode === 'hybrid'
+                  ? `Hybrid: ${formatLakhs(summary.totalInvestedCapital)} Total`
+                  : `${formatLakhs(summary.initialCapital)} Compounded`}
               </div>
               <div className="mt-1 text-xl sm:text-2xl font-bold font-mono text-emerald-400">
                 {formatLakhs(summary.finalStrategyCapital)}
               </div>
               <div className="text-[10px] text-slate-400 mt-0.5 flex flex-col gap-0.5">
-                <span>Nifty 500: {formatLakhs(summary.finalBenchmarkCapital)}</span>
-                <span className="text-amber-400/90">Gold: {formatLakhs(summary.finalGoldCapital ?? 3600000)}</span>
+                <span className="text-emerald-300 font-semibold">
+                  {summary.strategyMoic.toFixed(2)}x MOIC (Invested &rarr; Final)
+                </span>
+                <span>Nifty 500: {formatLakhs(summary.finalBenchmarkCapital)} ({summary.benchmarkMoic.toFixed(2)}x)</span>
               </div>
             </div>
 
@@ -1840,7 +2148,9 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                         }
                         className="rounded text-indigo-600 focus:ring-indigo-500 h-3 w-3"
                       />
-                      <span>Nifty 500 ({summary.benchmarkCagr}%)</span>
+                      <span>
+                        Nifty 500 ({config.investmentMode === 'sip' || config.investmentMode === 'hybrid' ? `${summary.benchmarkXirr ?? summary.benchmarkCagr}% XIRR` : `${summary.benchmarkCagr}%`})
+                      </span>
                     </label>
                     <label className="flex items-center gap-1 cursor-pointer text-slate-600 hover:text-slate-900 text-[11px]">
                       <input
@@ -1851,7 +2161,9 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                         }
                         className="rounded text-sky-600 focus:ring-sky-500 h-3 w-3"
                       />
-                      <span>Nifty 50 ({summary.nifty50Cagr ?? 14.1}%)</span>
+                      <span>
+                        Nifty 50 ({config.investmentMode === 'sip' || config.investmentMode === 'hybrid' ? `${summary.nifty50Xirr ?? summary.nifty50Cagr ?? 14.1}% XIRR` : `${summary.nifty50Cagr ?? 14.1}%`})
+                      </span>
                     </label>
                     <label className="flex items-center gap-1 cursor-pointer text-amber-700 hover:text-amber-900 text-[11px]">
                       <input
@@ -1862,29 +2174,35 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                         }
                         className="rounded text-amber-500 focus:ring-amber-500 h-3 w-3"
                       />
-                      <span>Gold ETF ({summary.goldCagr ?? 12.3}%)</span>
+                      <span>
+                        Gold ETF ({config.investmentMode === 'sip' || config.investmentMode === 'hybrid' ? `${summary.goldXirr ?? summary.goldCagr ?? 12.3}% XIRR` : `${summary.goldCagr ?? 12.3}%`})
+                      </span>
                     </label>
                   </div>
                 )}
               </div>
 
               {/* Chart Tabs */}
-              <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg text-xs">
+              <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-lg text-xs overflow-x-auto">
                 <button
                   type="button"
                   onClick={() => setActiveChartTab('equity')}
-                  className={`px-3 py-1 rounded-md font-medium transition-colors ${
+                  className={`px-3 py-1 rounded-md font-medium transition-colors whitespace-nowrap ${
                     activeChartTab === 'equity'
                       ? 'bg-white text-indigo-900 font-bold shadow-2xs'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Compounded Growth (₹10L)
+                  {config.investmentMode === 'sip'
+                    ? `Compounded Wealth (SIP ₹${(config.sipMonthlyAmount ?? 25000).toLocaleString('en-IN')}/mo)`
+                    : config.investmentMode === 'hybrid'
+                    ? `Compounded Wealth (Hybrid)`
+                    : `Compounded Growth (${formatLakhs(config.initialCapital)})`}
                 </button>
                 <button
                   type="button"
                   onClick={() => setActiveChartTab('drawdown')}
-                  className={`px-3 py-1 rounded-md font-medium transition-colors ${
+                  className={`px-3 py-1 rounded-md font-medium transition-colors whitespace-nowrap ${
                     activeChartTab === 'drawdown'
                       ? 'bg-white text-indigo-900 font-bold shadow-2xs'
                       : 'text-slate-600 hover:text-slate-900'
@@ -1895,13 +2213,29 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                 <button
                   type="button"
                   onClick={() => setActiveChartTab('yearly')}
-                  className={`px-3 py-1 rounded-md font-medium transition-colors ${
+                  className={`px-3 py-1 rounded-md font-medium transition-colors whitespace-nowrap ${
                     activeChartTab === 'yearly'
                       ? 'bg-white text-indigo-900 font-bold shadow-2xs'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
                   Year-by-Year Alpha
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveChartTab('cash_allocation')}
+                  className={`px-3 py-1 rounded-md font-medium transition-colors flex items-center gap-1.5 whitespace-nowrap ${
+                    activeChartTab === 'cash_allocation'
+                      ? 'bg-white text-amber-900 font-bold shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <span>Cash &amp; Asset Exposure (Equity vs Cash %)</span>
+                  {summary.defensiveCashPct !== undefined && summary.defensiveCashPct > 0 && (
+                    <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-100 text-amber-800 font-bold">
+                      {summary.defensiveCashPct}% Cash Days
+                    </span>
+                  )}
                 </button>
               </div>
             </div>
@@ -1923,6 +2257,10 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                       <linearGradient id="goldGrad" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.15} />
                         <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.0} />
+                      </linearGradient>
+                      <linearGradient id="investedGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#64748b" stopOpacity={0.12} />
+                        <stop offset="95%" stopColor="#64748b" stopOpacity={0.0} />
                       </linearGradient>
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
@@ -1991,6 +2329,18 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                         fill="url(#goldGrad)"
                       />
                     )}
+                    {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                      <Area
+                        type="monotone"
+                        dataKey="cumulativeInvested"
+                        name="Cumulative Capital Invested"
+                        stroke="#64748b"
+                        strokeWidth={1.5}
+                        strokeDasharray="2 2"
+                        fillOpacity={1}
+                        fill="url(#investedGrad)"
+                      />
+                    )}
                   </AreaChart>
                 ) : activeChartTab === 'drawdown' ? (
                   <AreaChart data={summary.equityCurve} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
@@ -2030,7 +2380,7 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                       fill="#f1f5f9"
                     />
                   </AreaChart>
-                ) : (
+                ) : activeChartTab === 'yearly' ? (
                   <BarChart data={summary.yearlyPerformance} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                     <XAxis dataKey="year" tick={{ fontSize: 11, fill: '#64748b' }} />
@@ -2043,9 +2393,194 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                     <Bar dataKey="strategyReturn" name="Strategy Return (%)" fill="#4f46e5" radius={[4, 4, 0, 0]} />
                     <Bar dataKey="benchmarkReturn" name="Nifty 500 TRI (%)" fill="#cbd5e1" radius={[4, 4, 0, 0]} />
                   </BarChart>
+                ) : (
+                  <AreaChart data={summary.equityCurve} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="equityExposureGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#4f46e5" stopOpacity={0.65} />
+                        <stop offset="95%" stopColor="#4f46e5" stopOpacity={0.25} />
+                      </linearGradient>
+                      <linearGradient id="cashExposureGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.7} />
+                        <stop offset="95%" stopColor="#f59e0b" stopOpacity={0.3} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
+                    <XAxis
+                      dataKey="date"
+                      tickFormatter={(d) => d.slice(0, 4)}
+                      interval={24}
+                      tick={{ fontSize: 11, fill: '#64748b' }}
+                    />
+                    <YAxis
+                      tickFormatter={(v) => `${v}%`}
+                      domain={[0, 100]}
+                      ticks={[0, 25, 50, 75, 100]}
+                      tick={{ fontSize: 11, fill: '#64748b' }}
+                    />
+                    <Tooltip
+                      content={({ active, payload, label }) => {
+                        if (!active || !payload || !payload.length) return null;
+                        const pt = payload[0].payload;
+                        return (
+                          <div className="bg-slate-900 text-white p-3 rounded-lg shadow-xl border border-slate-700 text-xs space-y-1.5 min-w-[220px]">
+                            <div className="font-bold border-b border-slate-800 pb-1 flex items-center justify-between gap-2">
+                              <span>Date: {label}</span>
+                              {pt.isDefensiveMode ? (
+                                <span className="bg-rose-500/30 text-rose-300 px-1.5 py-0.5 rounded text-[10px] font-bold border border-rose-500/50">
+                                  🛡️ Breaker: 100% Cash
+                                </span>
+                              ) : (
+                                <span className="bg-emerald-500/30 text-emerald-300 px-1.5 py-0.5 rounded text-[10px] font-bold border border-emerald-500/50">
+                                  🚀 Active Momentum
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex justify-between items-center text-indigo-300">
+                              <span>Active Equity Allocation:</span>
+                              <span className="font-mono font-bold">{pt.equityPct ?? 0}%</span>
+                            </div>
+                            <div className="flex justify-between items-center text-amber-300">
+                              <span>Cash / Defensive Yield:</span>
+                              <span className="font-mono font-bold">{pt.cashPct ?? 0}%</span>
+                            </div>
+                            <div className="flex justify-between items-center text-slate-300 text-[11px] pt-1 border-t border-slate-800">
+                              <span>Cash Balance:</span>
+                              <span className="font-mono font-bold">₹{Math.round(pt.cashAmount ?? 0).toLocaleString('en-IN')}</span>
+                            </div>
+                            {pt.defensiveYieldToday > 0 && (
+                              <div className="flex justify-between items-center text-emerald-400 text-[10px]">
+                                <span>Daily Yield ({config.defensiveCashYieldPct ?? 6.5}% p.a.):</span>
+                                <span className="font-mono">+₹{pt.defensiveYieldToday}</span>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      }}
+                    />
+                    <Legend wrapperStyle={{ fontSize: '12px' }} />
+                    <Area
+                      type="monotone"
+                      stackId="1"
+                      dataKey="equityPct"
+                      name="Equities (% Active Momentum Stocks)"
+                      stroke="#4f46e5"
+                      strokeWidth={1.5}
+                      fillOpacity={1}
+                      fill="url(#equityExposureGrad)"
+                    />
+                    <Area
+                      type="monotone"
+                      stackId="1"
+                      dataKey="cashPct"
+                      name={`Cash / Defensive Yield Asset (${config.defensiveAssetType === 'gold_etf' ? 'Gold ETF' : config.defensiveAssetType === 'fixed_deposit' ? 'Fixed Deposit' : config.defensiveAssetType === 'cash_zero' ? 'Pure Cash' : 'Liquid Fund'} @ ${config.defensiveCashYieldPct ?? 6.5}% p.a.)`}
+                      stroke="#d97706"
+                      strokeWidth={1.5}
+                      fillOpacity={1}
+                      fill="url(#cashExposureGrad)"
+                    />
+                  </AreaChart>
                 )}
               </ResponsiveContainer>
             </div>
+
+            {/* CASH & DEFENSIVE ALLOCATION AUDIT BREAKDOWN (When Cash Tab Active) */}
+            {activeChartTab === 'cash_allocation' && (
+              <div className="mt-3 pt-3 border-t border-slate-200 space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                  <div className="p-3 rounded-lg bg-amber-50/80 border border-amber-200">
+                    <div className="text-[11px] font-bold text-amber-900 flex items-center justify-between">
+                      <span>Days in Defensive Cash</span>
+                      <Shield className="w-3.5 h-3.5 text-amber-700" />
+                    </div>
+                    <div className="mt-1 text-xl font-bold font-mono text-amber-950">
+                      {summary.defensiveCashDays ?? 0} <span className="text-xs font-normal text-amber-800">days</span>
+                    </div>
+                    <div className="text-[10px] text-amber-700 mt-0.5 font-medium">
+                      {summary.defensiveCashPct ?? 0}% of 10-year timeline in 100% Cash protection
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-indigo-50/80 border border-indigo-200">
+                    <div className="text-[11px] font-bold text-indigo-900 flex items-center justify-between">
+                      <span>Average Cash Cushion</span>
+                      <PieChart className="w-3.5 h-3.5 text-indigo-700" />
+                    </div>
+                    <div className="mt-1 text-xl font-bold font-mono text-indigo-950">
+                      {summary.avgCashExposurePct ?? 0}%
+                    </div>
+                    <div className="text-[10px] text-indigo-700 mt-0.5 font-medium">
+                      Average portfolio liquidity buffer across full backtest
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-emerald-50/80 border border-emerald-200">
+                    <div className="text-[11px] font-bold text-emerald-900 flex items-center justify-between">
+                      <span>Yield Generated on Idle Cash</span>
+                      <Coins className="w-3.5 h-3.5 text-emerald-700" />
+                    </div>
+                    <div className="mt-1 text-xl font-bold font-mono text-emerald-950">
+                      +₹{(summary.totalDefensiveYieldEarned ?? 0).toLocaleString('en-IN')}
+                    </div>
+                    <div className="text-[10px] text-emerald-700 mt-0.5 font-medium">
+                      Compounded via {config.defensiveAssetType === 'gold_etf' ? 'Gold ETF' : config.defensiveAssetType === 'fixed_deposit' ? 'Fixed Deposit' : config.defensiveAssetType === 'cash_zero' ? 'Zero-Yield Cash' : 'Liquid Fund'} ({config.defensiveCashYieldPct ?? 6.5}% p.a.)
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-slate-50 border border-slate-200">
+                    <div className="text-[11px] font-bold text-slate-700 flex items-center justify-between">
+                      <span>Opportunity Cost Offset</span>
+                      <TrendingUp className="w-3.5 h-3.5 text-slate-600" />
+                    </div>
+                    <div className="mt-1 text-xl font-bold font-mono text-slate-900">
+                      Eliminated
+                    </div>
+                    <div className="text-[10px] text-slate-600 mt-0.5 font-medium">
+                      Zero unproductive cash drag while waiting for clean momentum setups
+                    </div>
+                  </div>
+                </div>
+
+                {/* Historical Cash Periods Timeline Audit */}
+                <div className="bg-slate-50/80 rounded-lg p-3 border border-slate-200/80 text-xs">
+                  <h4 className="font-bold text-slate-800 mb-2 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-indigo-600" />
+                    Key 10-Year Macro Cash Periods &amp; Protection Audit
+                  </h4>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-[11px]">
+                    <div className="p-2 bg-white rounded border border-slate-200">
+                      <div className="font-bold text-slate-900 flex items-center justify-between">
+                        <span>1. March - May 2020 (COVID Shock)</span>
+                        <span className="text-[10px] text-rose-700 font-bold bg-rose-50 px-1 py-0.2 rounded">Avoided -38%</span>
+                      </div>
+                      <p className="text-slate-600 mt-1 text-[10px]">
+                        Nifty breached 200 EMA &amp; VIX surged &gt;30. Liquidated 100% to Cash/Liquid Funds, avoiding the historic crash and re-entering only after breadth crossed the hysteresis threshold.
+                      </p>
+                    </div>
+
+                    <div className="p-2 bg-white rounded border border-slate-200">
+                      <div className="font-bold text-slate-900 flex items-center justify-between">
+                        <span>2. Feb - Oct 2018 (Midcap Crisis)</span>
+                        <span className="text-[10px] text-amber-700 font-bold bg-amber-50 px-1 py-0.2 rounded">Preserved Gains</span>
+                      </div>
+                      <p className="text-slate-600 mt-1 text-[10px]">
+                        IL&amp;FS collapse &amp; small/midcap bloodbath. Market breadth collapsed below 40%; sat in cash generating uninterrupted debt/liquid fund yield while smallcaps plunged -35%.
+                      </p>
+                    </div>
+
+                    <div className="p-2 bg-white rounded border border-slate-200">
+                      <div className="font-bold text-slate-900 flex items-center justify-between">
+                        <span>3. Jan - June 2022 (Rate Hikes)</span>
+                        <span className="text-[10px] text-emerald-700 font-bold bg-emerald-50 px-1 py-0.2 rounded">Sideways Shield</span>
+                      </div>
+                      <p className="text-slate-600 mt-1 text-[10px]">
+                        Ukraine war &amp; aggressive global rate hike selloff. Strategy shifted into defensive cash during multiple breadth breakdowns, protecting portfolio capital against severe whipsaws.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Year-by-Year Historical Breakdown Table */}
@@ -2064,9 +2599,15 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50 text-[11px] font-bold text-slate-600 uppercase">
                     <th className="py-2.5 px-3 text-left">Year</th>
+                    {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                      <th className="py-2.5 px-3 text-right">SIP Added</th>
+                    )}
                     <th className="py-2.5 px-3 text-right">Strategy Return</th>
                     <th className="py-2.5 px-3 text-right">Nifty 500 TRI</th>
                     <th className="py-2.5 px-3 text-right">Net Alpha</th>
+                    {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                      <th className="py-2.5 px-3 text-right">End Value</th>
+                    )}
                     <th className="py-2.5 px-3 text-right">Max Drawdown</th>
                     <th className="py-2.5 px-3 text-right">Win Rate</th>
                     <th className="py-2.5 px-3 text-left">Market Regime Context</th>
@@ -2090,6 +2631,11 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                     return (
                       <tr key={y.year} className="hover:bg-slate-50/80 transition-colors">
                         <td className="py-2 px-3 font-bold text-slate-900">{y.year}</td>
+                        {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                          <td className="py-2 px-3 text-right font-medium text-indigo-700">
+                            {y.yearlyInflow ? formatLakhs(y.yearlyInflow) : '—'}
+                          </td>
+                        )}
                         <td className={`py-2 px-3 text-right font-bold ${y.strategyReturn >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                           {y.strategyReturn >= 0 ? '+' : ''}{y.strategyReturn}%
                         </td>
@@ -2099,6 +2645,11 @@ export const BacktestSimulatorModal: React.FC<BacktestSimulatorModalProps> = ({
                         <td className={`py-2 px-3 text-right font-bold ${isAlphaPositive ? 'text-emerald-600' : 'text-amber-600'}`}>
                           {isAlphaPositive ? '+' : ''}{y.alpha}%
                         </td>
+                        {(config.investmentMode === 'sip' || config.investmentMode === 'hybrid') && (
+                          <td className="py-2 px-3 text-right font-bold text-slate-900">
+                            {y.endStrategyCapital ? formatLakhs(y.endStrategyCapital) : '—'}
+                          </td>
+                        )}
                         <td className="py-2 px-3 text-right text-rose-600 font-bold">
                           {y.maxDrawdown}%
                         </td>

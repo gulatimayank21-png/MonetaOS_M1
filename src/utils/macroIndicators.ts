@@ -54,10 +54,11 @@ const VIX_ANCHORS: Array<{ startDate: string; endDate: string; peakVix: number; 
 ];
 
 /**
- * Calculates synthetic Nifty 50, Nifty 500, moving averages, Breadth metrics, and India VIX across the matrix dates.
+ * Builds Nifty 50, Nifty 500, moving averages, Breadth metrics, and India VIX across the matrix dates.
+ * Uses real historical macro data from macro_daily (v2.1.0 database) with moving averages and real breadth.
  */
 export function buildMacroDailyTimeline(matrix: InMemMarketMatrix): MacroDailyTimeline {
-  const { allDates, symbols, data, symbolCandles, symbolDateIdx } = matrix;
+  const { allDates, symbols, data, symbolCandles, symbolDateIdx, macroData } = matrix;
   const len = allDates.length;
 
   const nifty50: number[] = new Array(len).fill(0);
@@ -77,68 +78,108 @@ export function buildMacroDailyTimeline(matrix: InMemMarketMatrix): MacroDailyTi
   const breadthPctAbove200Dma: number[] = new Array(len).fill(50);
   const nifty500_20d_dropPct: number[] = new Array(len).fill(0);
 
+  // Check if real macro instruments are available in memory
+  const hasRealNifty50 = macroData && macroData.has('NIFTY 50') && macroData.get('NIFTY 50')!.size > 0;
+  const hasRealNifty500 = macroData && macroData.has('NIFTY 500') && macroData.get('NIFTY 500')!.size > 0;
+  const hasRealVix = macroData && macroData.has('INDIA VIX') && macroData.get('INDIA VIX')!.size > 0;
+
   let prevNifty50 = 8000;
   let prevNifty500 = 6500;
 
-  // 1. Synthesize daily index levels based on breadth & weighted price action
+  // 1. Populate direct index levels & VIX from real macro_daily or graceful fallback
   for (let i = 0; i < len; i++) {
     const d = allDates[i];
-    let sum50 = 0;
-    let count50 = 0;
-    let sum500 = 0;
-    let count500 = 0;
 
-    for (let s = 0; s < symbols.length; s++) {
-      const sym = symbols[s];
-      const candle = data.get(sym)?.get(d);
-      if (candle && candle.close > 0) {
-        sum500 += candle.close;
-        count500++;
-        if (NIFTY_50_TICKERS.has(sym)) {
-          sum50 += candle.close;
-          count50++;
-        }
+    // NIFTY 50
+    if (hasRealNifty50) {
+      const n50Candle = macroData!.get('NIFTY 50')!.get(d);
+      if (n50Candle && n50Candle.close > 0) {
+        nifty50[i] = n50Candle.close;
+        prevNifty50 = n50Candle.close;
+      } else {
+        nifty50[i] = prevNifty50;
       }
     }
 
-    if (i === 0) {
-      nifty50[i] = 8200;
-      nifty500[i] = 6800;
-    } else {
-      // Calculate daily index returns
-      const prevDate = allDates[i - 1];
-      let ret50Sum = 0;
-      let ret50Count = 0;
-      let ret500Sum = 0;
-      let ret500Count = 0;
+    // NIFTY 500
+    if (hasRealNifty500) {
+      const n500Candle = macroData!.get('NIFTY 500')!.get(d);
+      if (n500Candle && n500Candle.close > 0) {
+        nifty500[i] = n500Candle.close;
+        prevNifty500 = n500Candle.close;
+      } else {
+        nifty500[i] = prevNifty500;
+      }
+    }
+
+    // INDIA VIX
+    if (hasRealVix) {
+      const vixCandle = macroData!.get('INDIA VIX')!.get(d);
+      if (vixCandle && vixCandle.close > 0) {
+        indiaVix[i] = vixCandle.close;
+      } else if (i > 0) {
+        indiaVix[i] = indiaVix[i - 1];
+      }
+    }
+
+    // Fallback synthesis if real macro table is missing (e.g. mock unit tests)
+    if (!hasRealNifty50 || !hasRealNifty500) {
+      let sum50 = 0;
+      let count50 = 0;
+      let sum500 = 0;
+      let count500 = 0;
 
       for (let s = 0; s < symbols.length; s++) {
         const sym = symbols[s];
-        const candleNow = data.get(sym)?.get(d);
-        const candlePrev = data.get(sym)?.get(prevDate);
-        if (candleNow && candlePrev && candleNow.close > 0 && candlePrev.close > 0) {
-          const r = (candleNow.close - candlePrev.close) / candlePrev.close;
-          ret500Sum += r;
-          ret500Count++;
+        const candle = data.get(sym)?.get(d);
+        if (candle && candle.close > 0) {
+          sum500 += candle.close;
+          count500++;
           if (NIFTY_50_TICKERS.has(sym)) {
-            ret50Sum += r;
-            ret50Count++;
+            sum50 += candle.close;
+            count50++;
           }
         }
       }
 
-      const dailyRet50 = ret50Count > 0 ? ret50Sum / ret50Count : 0.0004;
-      const dailyRet500 = ret500Count > 0 ? ret500Sum / ret500Count : 0.0005;
+      if (i === 0) {
+        if (!hasRealNifty50) nifty50[i] = 8200;
+        if (!hasRealNifty500) nifty500[i] = 6800;
+      } else {
+        const prevDate = allDates[i - 1];
+        let ret50Sum = 0;
+        let ret50Count = 0;
+        let ret500Sum = 0;
+        let ret500Count = 0;
 
-      nifty50[i] = prevNifty50 * (1 + dailyRet50);
-      nifty500[i] = prevNifty500 * (1 + dailyRet500);
+        for (let s = 0; s < symbols.length; s++) {
+          const sym = symbols[s];
+          const candleNow = data.get(sym)?.get(d);
+          const candlePrev = data.get(sym)?.get(prevDate);
+          if (candleNow && candlePrev && candleNow.close > 0 && candlePrev.close > 0) {
+            const r = (candleNow.close - candlePrev.close) / candlePrev.close;
+            ret500Sum += r;
+            ret500Count++;
+            if (NIFTY_50_TICKERS.has(sym)) {
+              ret50Sum += r;
+              ret50Count++;
+            }
+          }
+        }
+
+        const dailyRet50 = ret50Count > 0 ? ret50Sum / ret50Count : 0.0004;
+        const dailyRet500 = ret500Count > 0 ? ret500Sum / ret500Count : 0.0005;
+
+        if (!hasRealNifty50) nifty50[i] = prevNifty50 * (1 + dailyRet50);
+        if (!hasRealNifty500) nifty500[i] = prevNifty500 * (1 + dailyRet500);
+      }
+
+      if (!hasRealNifty50) prevNifty50 = nifty50[i];
+      if (!hasRealNifty500) prevNifty500 = nifty500[i];
     }
-
-    prevNifty50 = nifty50[i];
-    prevNifty500 = nifty500[i];
   }
 
-  // 2. Compute 200 DMA, 200 EMA, 100 EMA, 50 DMA, 50 EMA for Benchmarks
+  // 2. Compute 200 DMA, 200 EMA, 100 EMA, 50 DMA, 50 EMA for Benchmarks from real series
   const ema200Multiplier = 2 / (200 + 1);
   const ema100Multiplier = 2 / (100 + 1);
   const ema50Multiplier = 2 / (50 + 1);
@@ -202,36 +243,38 @@ export function buildMacroDailyTimeline(matrix: InMemMarketMatrix): MacroDailyTi
     }
     nifty500_20d_dropPct[i] = peak20 > 0 ? ((nifty500[i] - peak20) / peak20) * 100 : 0;
 
-    // 3. Compute Realized Volatility + Historical VIX calibration
-    const dateStr = allDates[i];
-    let baseVixVal = 13.8;
+    // Fallback VIX calibration only if real VIX series was not in macro table
+    if (!hasRealVix) {
+      const dateStr = allDates[i];
+      let baseVixVal = 13.8;
 
-    const volStart = Math.max(0, i - 19);
-    let returnsSum = 0;
-    let returnsCount = 0;
-    for (let v = volStart + 1; v <= i; v++) {
-      const r = (nifty50[v] - nifty50[v - 1]) / nifty50[v - 1];
-      returnsSum += r * r;
-      returnsCount++;
-    }
-    const realizedDailyVar = returnsCount > 0 ? returnsSum / returnsCount : 0.0001;
-    const annualizedRealizedVol = Math.sqrt(realizedDailyVar * 252) * 100;
-
-    let anchorVix = 0;
-    for (const anchor of VIX_ANCHORS) {
-      if (dateStr >= anchor.startDate && dateStr <= anchor.endDate) {
-        anchorVix = Math.max(anchorVix, anchor.peakVix);
-        break;
+      const volStart = Math.max(0, i - 19);
+      let returnsSum = 0;
+      let returnsCount = 0;
+      for (let v = volStart + 1; v <= i; v++) {
+        const r = (nifty50[v] - nifty50[v - 1]) / (nifty50[v - 1] || 1);
+        returnsSum += r * r;
+        returnsCount++;
       }
-    }
+      const realizedDailyVar = returnsCount > 0 ? returnsSum / returnsCount : 0.0001;
+      const annualizedRealizedVol = Math.sqrt(realizedDailyVar * 252) * 100;
 
-    if (anchorVix > 0) {
-      baseVixVal = Math.max(anchorVix, annualizedRealizedVol * 1.2);
-    } else {
-      baseVixVal = Math.max(12.0, annualizedRealizedVol * 1.1);
-    }
+      let anchorVix = 0;
+      for (const anchor of VIX_ANCHORS) {
+        if (dateStr >= anchor.startDate && dateStr <= anchor.endDate) {
+          anchorVix = Math.max(anchorVix, anchor.peakVix);
+          break;
+        }
+      }
 
-    indiaVix[i] = parseFloat(baseVixVal.toFixed(2));
+      if (anchorVix > 0) {
+        baseVixVal = Math.max(anchorVix, annualizedRealizedVol * 1.2);
+      } else {
+        baseVixVal = Math.max(12.0, annualizedRealizedVol * 1.1);
+      }
+
+      indiaVix[i] = parseFloat(baseVixVal.toFixed(2));
+    }
   }
 
   // 4. Precompute Stock-by-Stock 50 EMA, 50 DMA, 200 DMA to build 100% Real Market Breadth
@@ -364,7 +407,8 @@ export function isMacroCircuitBreakerActive(
   dateIdx: number,
   macroFilter: MacroRegimeFilter = 'none',
   vixThreshold: number = 25,
-  circuitBreakers?: CircuitBreakersConfig
+  circuitBreakers?: CircuitBreakersConfig,
+  wasInDefensiveCash: boolean = false
 ): CircuitBreakerEvaluation {
   // 1. If modern CircuitBreakersConfig is provided and enabled, evaluate multi-condition OR/AND rules
   if (circuitBreakers && circuitBreakers.enabled) {
@@ -412,18 +456,19 @@ export function isMacroCircuitBreakerActive(
     }
 
     // Rule C: Market Breadth Breakdown (e.g. % of Nifty 500 stocks > 50 EMA < 45%)
+    let currentBreadthPct = 0;
+    let breadthIndLabel = '50 EMA';
     if (circuitBreakers.marketBreadth?.enabled) {
       totalEnabledRules++;
       const ind = circuitBreakers.marketBreadth.indicator ?? '50_EMA';
-      let breadthPct = 0;
-      if (ind === '50_EMA') breadthPct = timeline.breadthPctAbove50Ema[dateIdx];
-      else if (ind === '50_DMA') breadthPct = timeline.breadthPctAbove50Dma[dateIdx];
-      else if (ind === '200_DMA') breadthPct = timeline.breadthPctAbove200Dma[dateIdx];
+      breadthIndLabel = ind.replace('_', ' ');
+      if (ind === '50_EMA') currentBreadthPct = timeline.breadthPctAbove50Ema[dateIdx];
+      else if (ind === '50_DMA') currentBreadthPct = timeline.breadthPctAbove50Dma[dateIdx];
+      else if (ind === '200_DMA') currentBreadthPct = timeline.breadthPctAbove200Dma[dateIdx];
 
       const threshold = circuitBreakers.marketBreadth.thresholdPct ?? 45;
-      if (breadthPct < threshold) {
-        const indLabel = ind.replace('_', ' ');
-        triggeredRules.push(`Breadth (${breadthPct.toFixed(0)}% > ${indLabel}) < ${threshold}%`);
+      if (currentBreadthPct < threshold) {
+        triggeredRules.push(`Breadth (${currentBreadthPct.toFixed(0)}% > ${breadthIndLabel}) < ${threshold}%`);
       }
     }
 
@@ -448,6 +493,20 @@ export function isMacroCircuitBreakerActive(
           label: `${triggeredRules.length} Breaker${triggeredRules.length > 1 ? 's' : ''} Active (${circuitBreakers.logic})`,
           triggeredRules,
         };
+      }
+
+      // If exit breaker rules are NOT active, but we were in defensive cash:
+      // Enforce customizable Re-Entry Threshold if configured
+      if (wasInDefensiveCash && circuitBreakers.marketBreadth?.enabled) {
+        const reEntryTarget = circuitBreakers.marketBreadth.reEntryThresholdPct ?? circuitBreakers.marketBreadth.thresholdPct;
+        if (currentBreadthPct < reEntryTarget) {
+          return {
+            isActive: true,
+            reason: `Awaiting Re-Entry Confirmation: Market Breadth (${currentBreadthPct.toFixed(0)}% > ${breadthIndLabel}) < ${reEntryTarget}% Re-Entry Gate`,
+            label: `Re-Entry Gate (Breadth < ${reEntryTarget}%)`,
+            triggeredRules: [`Breadth (${currentBreadthPct.toFixed(0)}%) < ${reEntryTarget}% Re-Entry Gate`],
+          };
+        }
       }
 
       return {

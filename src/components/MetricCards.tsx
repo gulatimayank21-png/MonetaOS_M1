@@ -103,11 +103,15 @@ export const MetricCards: React.FC<MetricCardsProps> = ({
         </div>
         <div className="mt-2">
           <div className="text-sm font-bold text-indigo-950 truncate">
-            {dominantSectorInfo ? dominantSectorInfo.sector : 'No Concentrated Cluster'}
+            {dominantSectorInfo ? dominantSectorInfo.sector : 'Broad Breadth'}
           </div>
           <div className="flex items-center gap-2 mt-0.5">
             <span className="text-[11px] font-semibold text-indigo-800 bg-indigo-100/70 border border-indigo-200/60 px-2 py-0.5 rounded-full">
-              {dominantSectorInfo ? `${dominantSectorInfo.overlappingCount} Stocks (${dominantSectorInfo.percentageOfOverlapping}% of Winners)` : 'Diversified'}
+              {dominantSectorInfo
+                ? dominantSectorInfo.overlappingCount > 0
+                  ? `${dominantSectorInfo.overlappingCount} in Top ${cutoffPct}% (${dominantSectorInfo.percentageOfOverlapping}% of Winners)`
+                  : `${dominantSectorInfo.baselineWinnerCount || 0} Macro Universe Leaders`
+                : 'Diversified'}
             </span>
           </div>
         </div>

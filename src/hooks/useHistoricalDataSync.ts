@@ -16,10 +16,11 @@ import type {
   WarmupCompleteResponse,
   BacktestCompleteResponse,
   SyncDeltasResultResponse,
+  LatestMetricsResultResponse,
   ErrorResponse,
   DbStatusData,
 } from '../workers/dbWorker';
-import { BacktestConfig, BacktestSummary } from '../types';
+import { BacktestConfig, BacktestSummary, ComputedStockMetric } from '../types';
 import {
   APP_DB_VERSION,
   DB_DOWNLOAD_URL,
@@ -38,8 +39,10 @@ export interface UseHistoricalDataSyncReturn {
   dbStats: DbStatusData | null;
   deltaSync: DeltaSyncResult | null;
   hasCachedData: boolean;
+  latestComputedMetrics: ComputedStockMetric[] | null;
   startWarmup: (forceDownload?: boolean) => void;
   syncDeltas: () => Promise<DeltaSyncResult>;
+  computeLatestUniverse: () => Promise<{ metrics: ComputedStockMetric[]; maxDate: string; totalComputed: number }>;
   runQuery: <T = any>(sql: string, params?: any[]) => Promise<T[]>;
   runRealBacktest: (config: BacktestConfig) => Promise<{ summary: BacktestSummary; executionTimeMs: number }>;
   checkCache: () => void;
@@ -53,6 +56,7 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
   const [dbStats, setDbStats] = useState<DbStatusData | null>(null);
   const [deltaSync, setDeltaSync] = useState<DeltaSyncResult | null>(null);
   const [hasCachedData, setHasCachedData] = useState<boolean>(false);
+  const [latestComputedMetrics, setLatestComputedMetrics] = useState<ComputedStockMetric[] | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
   const pendingRequestsRef = useRef<
@@ -179,6 +183,9 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
           if (res.deltaSync) {
             setDeltaSync(res.deltaSync);
           }
+          if (res.computedMetrics && res.computedMetrics.length > 0) {
+            setLatestComputedMetrics(res.computedMetrics);
+          }
           setStatus('ready');
           setProgress(100);
           const syncNote = res.deltaSync && res.deltaSync.syncedCount > 0
@@ -208,8 +215,27 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
           const res = response as SyncDeltasResultResponse;
           setDbStats(res.status);
           setDeltaSync(res.result);
+          if (res.computedMetrics && res.computedMetrics.length > 0) {
+            setLatestComputedMetrics(res.computedMetrics);
+          }
           if (pending) {
             pending.resolve(res.result);
+            pendingRequestsRef.current.delete(id);
+          }
+          break;
+        }
+
+        case 'LATEST_METRICS_RESULT': {
+          const res = response as LatestMetricsResultResponse;
+          if (res.metrics && res.metrics.length > 0) {
+            setLatestComputedMetrics(res.metrics);
+          }
+          if (pending) {
+            pending.resolve({
+              metrics: res.metrics,
+              maxDate: res.maxDate,
+              totalComputed: res.totalComputed,
+            });
             pendingRequestsRef.current.delete(id);
           }
           break;
@@ -365,6 +391,18 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
     [getNextId, sendWorkerMessage]
   );
 
+  // Explicitly trigger a universe computation from the SQLite database
+  const computeLatestUniverse = useCallback(
+    async (): Promise<{ metrics: ComputedStockMetric[]; maxDate: string; totalComputed: number }> => {
+      const id = getNextId();
+      return sendWorkerMessage({
+        id,
+        type: 'COMPUTE_LATEST_METRICS',
+      });
+    },
+    [getNextId, sendWorkerMessage]
+  );
+
   // Execute authentic Real-Data Quantitative Simulation over 10-year OHLCV in the worker
   const runRealBacktest = useCallback(
     async (config: BacktestConfig): Promise<{ summary: BacktestSummary; executionTimeMs: number }> => {
@@ -386,8 +424,10 @@ export function useHistoricalDataSync(): UseHistoricalDataSyncReturn {
     dbStats,
     deltaSync,
     hasCachedData,
+    latestComputedMetrics,
     startWarmup,
     syncDeltas,
+    computeLatestUniverse,
     runQuery,
     runRealBacktest,
     checkCache,

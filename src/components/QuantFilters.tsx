@@ -147,7 +147,7 @@ export const QuantFilters: React.FC<QuantFiltersProps> = ({
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                Top {pct}% {pct === 25 ? '★ (Rule)' : ''}
+                Top {pct}% {pct === 10 ? '★ (Default)' : ''}
               </button>
             ))}
           </div>

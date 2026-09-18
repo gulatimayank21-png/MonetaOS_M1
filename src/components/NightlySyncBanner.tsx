@@ -22,7 +22,7 @@ const DEFAULT_BANNER_STATUS: NightlySyncStatus = {
   status: 'success',
   syncMode: 'live_nse_direct',
   errorMessage: null,
-  scheduledCron: 'Daily at 00:00 IST (Official NSE Archive EOD Batch)',
+  scheduledCron: 'Daily at 18:30 IST (06:30 PM IST Post-Market Bhavcopy Batch)',
   source: 'Official National Stock Exchange of India (archives.nseindia.com)',
   updatedIndices: ['nifty500', 'nifty50', 'niftynext50', 'niftymidcap150', 'niftysmallcap250'],
   stockCounts: {
