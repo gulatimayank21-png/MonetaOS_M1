@@ -16,6 +16,21 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
+# Instruments to extract
+SPECIAL_ETFS = {"GOLDBEES", "LIQUIDBEES"}
+TARGET_INDICES = {
+    "NIFTY 50": "NIFTY 50",
+    "NIFTY 500": "NIFTY 500",
+    "INDIA VIX": "INDIA VIX"
+}
+
+def clean_num(val, default=0.0):
+    try:
+        clean = str(val).replace(",", "").strip()
+        return float(clean) if clean not in ["-", ""] else default
+    except (ValueError, TypeError):
+        return default
+
 def get_current_ist_date() -> datetime.date:
     """Returns today's date in Indian Standard Time (UTC + 5:30)."""
     utc_now = datetime.datetime.now(datetime.timezone.utc)
@@ -23,10 +38,13 @@ def get_current_ist_date() -> datetime.date:
     return ist_now.date()
 
 def fetch_bhavcopy_deltas(target_date: datetime.date):
-    # Weekday check: Monday = 0, Sunday = 6
+    """
+    Fetches the static UDiFF Bhavcopy and separates cash equities 
+    from whitelisted ETFs (GOLDBEES, LIQUIDBEES).
+    """
     if target_date.weekday() >= 5:
         print(f"{target_date} is a weekend. Market closed.")
-        return []
+        return [], []
 
     date_ymd = target_date.strftime("%Y%m%d")
     filename = f"BhavCopy_NSE_CM_0_0_0_{date_ymd}_F_0000.csv.zip"
@@ -40,11 +58,11 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
         res = session.get(url, timeout=25)
     except Exception as e:
         print(f"Network connection error: {e}")
-        return []
+        return [], []
 
     if res.status_code != 200:
         print(f"No Bhavcopy available for {target_date} (Status: {res.status_code}). Likely exchange holiday or file not published yet.")
-        return []
+        return [], []
 
     try:
         with zipfile.ZipFile(io.BytesIO(res.content)) as z:
@@ -53,7 +71,7 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
                 df = pd.read_csv(f)
     except Exception as e:
         print(f"Failed to decompress zip archive: {e}")
-        return []
+        return [], []
 
     df.columns = [c.strip() for c in df.columns]
 
@@ -68,25 +86,94 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
             "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "TOTTRDQTY"
         )
 
-    deltas = []
+    stock_deltas = []
+    etf_deltas = []
     trade_date_str = target_date.strftime("%Y-%m-%d")
+
     for _, row in df.iterrows():
         try:
-            deltas.append({
-                "symbol": str(row[sym_col]).strip(),
+            symbol = str(row[sym_col]).strip()
+            item = {
+                "symbol": symbol,
                 "trade_date": trade_date_str,
-                "open": float(row[open_col]),
-                "high": float(row[high_col]),
-                "low": float(row[low_col]),
-                "close": float(row[close_col]),
-                "volume": int(row[vol_col])
-            })
+                "open": clean_num(row[open_col]),
+                "high": clean_num(row[high_col]),
+                "low": clean_num(row[low_col]),
+                "close": clean_num(row[close_col]),
+                "volume": int(clean_num(row[vol_col]))
+            }
+
+            if symbol in SPECIAL_ETFS:
+                etf_deltas.append({
+                    "index_name": symbol,
+                    "trade_date": trade_date_str,
+                    "open": item["open"],
+                    "high": item["high"],
+                    "low": item["low"],
+                    "close": item["close"],
+                    "volume": item["volume"]
+                })
+            else:
+                stock_deltas.append(item)
         except (ValueError, TypeError):
             continue
 
-    return deltas
+    return stock_deltas, etf_deltas
+
+def fetch_macro_indices_deltas(target_date: datetime.date):
+    """
+    Fetches official closing numbers for NIFTY 50, NIFTY 500, and INDIA VIX
+    directly from NSE archives.
+    """
+    if target_date.weekday() >= 5:
+        return []
+
+    date_dmy = target_date.strftime("%d%m%Y")
+    trade_date_str = target_date.strftime("%Y-%m-%d")
+    url = f"https://archives.nseindia.com/content/indices/ind_close_all_{date_dmy}.csv"
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        res = session.get(url, timeout=20)
+        if res.status_code != 200:
+            print(f"No index file available for {target_date} (Status: {res.status_code}).")
+            return []
+
+        df = pd.read_csv(io.StringIO(res.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        name_col = next((c for c in df.columns if "index name" in c), None)
+        open_col = next((c for c in df.columns if "open" in c), None)
+        high_col = next((c for c in df.columns if "high" in c), None)
+        low_col = next((c for c in df.columns if "low" in c), None)
+        close_col = next((c for c in df.columns if "close" in c), None)
+        vol_col = next((c for c in df.columns if "volume" in c or "shares" in c), None)
+
+        if not (name_col and close_col):
+            return []
+
+        indices_data = []
+        for _, row in df.iterrows():
+            raw_name = str(row[name_col]).strip().upper()
+            if raw_name in TARGET_INDICES:
+                indices_data.append({
+                    "index_name": TARGET_INDICES[raw_name],
+                    "trade_date": trade_date_str,
+                    "open": clean_num(row[open_col]),
+                    "high": clean_num(row[high_col]),
+                    "low": clean_num(row[low_col]),
+                    "close": clean_num(row[close_col]),
+                    "volume": int(clean_num(row[vol_col])) if vol_col else 0
+                })
+        return indices_data
+    except Exception as e:
+        print(f"Warning: Could not fetch indices for {target_date}: {e}")
+        return []
 
 def fetch_corporate_action_alerts():
+    """Fetches upcoming corporate actions for stocks and monitors special ETFs."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -105,14 +192,17 @@ def fetch_corporate_action_alerts():
             actions = res.json()
             for act in actions:
                 subj = str(act.get("subject", "")).lower()
+                sym = str(act.get("symbol", "")).strip().upper()
+
                 if any(w in subj for w in ["split", "sub-division", "bonus", "merger", "amalgamation", "demerger"]):
                     alerts.append({
-                        "symbol": act.get("symbol"),
+                        "symbol": sym,
                         "series": act.get("series"),
                         "subject": act.get("subject"),
                         "ex_date": act.get("exDate"),
                         "record_date": act.get("recDate"),
-                        "ca_broadcast_date": act.get("bcStartDate")
+                        "ca_broadcast_date": act.get("bcStartDate"),
+                        "is_macro_instrument": sym in SPECIAL_ETFS
                     })
             print(f"Successfully collected {len(alerts)} corporate action alerts from NSE.")
         else:
@@ -126,14 +216,19 @@ def main():
     target_date = get_current_ist_date()
     print(f"Executing sync for IST date: {target_date}")
     
-    deltas = fetch_bhavcopy_deltas(target_date)
+    stock_deltas, etf_deltas = fetch_bhavcopy_deltas(target_date)
+    index_deltas = fetch_macro_indices_deltas(target_date)
+    all_macro_deltas = etf_deltas + index_deltas
+
     alerts = fetch_corporate_action_alerts()
 
     output_deltas = {
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "target_date": target_date.strftime("%Y-%m-%d"),
-        "record_count": len(deltas),
-        "data": deltas
+        "record_count": len(stock_deltas),
+        "macro_count": len(all_macro_deltas),
+        "data": stock_deltas,
+        "macro_data": all_macro_deltas
     }
 
     output_alerts = {
@@ -151,7 +246,8 @@ def main():
     with open(alerts_path, "w") as f:
         json.dump(output_alerts, f, indent=2)
 
-    print(f"Saved {len(deltas)} candles to {deltas_path}")
+    print(f"Saved {len(stock_deltas)} stock candles to {deltas_path}")
+    print(f"Saved {len(all_macro_deltas)} macro candles (N50, N500, VIX, GOLDBEES, LIQUIDBEES) to {deltas_path}")
     print(f"Saved {len(alerts)} alerts to {alerts_path}")
 
 if __name__ == "__main__":
