@@ -14,7 +14,7 @@ HEADERS = {
     "Accept": "*/*"
 }
 
-# Target Instruments
+# Special instruments to capture
 SPECIAL_ETFS = {"GOLDBEES", "LIQUIDBEES"}
 TARGET_INDICES = {
     "NIFTY 50": "NIFTY 50",
@@ -38,26 +38,26 @@ def get_current_ist_date() -> datetime.date:
 
 def fetch_bhavcopy_deltas(target_date: datetime.date):
     """
-    Fetches the daily static UDiFF Bhavcopy from NSE archives,
-    separating cash equities from whitelisted ETFs (GOLDBEES, LIQUIDBEES).
+    Fetches the static UDiFF Bhavcopy and separates cash equities 
+    from whitelisted ETFs (GOLDBEES, LIQUIDBEES).
     """
     if target_date.weekday() >= 5:
-        print(f"{target_date} is a weekend. Cash market closed.")
+        print(f"{target_date} is a weekend. Market closed.")
         return [], []
 
     date_ymd = target_date.strftime("%Y%m%d")
     filename = f"BhavCopy_NSE_CM_0_0_0_{date_ymd}_F_0000.csv.zip"
     url = f"https://nsearchives.nseindia.com/content/cm/{filename}"
     
-    print(f"Requesting static Bhavcopy from: {url}")
+    print(f"Requesting static Bhavcopy for {target_date} from: {url}")
     try:
         res = requests.get(url, headers=HEADERS, timeout=25)
     except Exception as e:
-        print(f"Bhavcopy network error: {e}")
+        print(f"Bhavcopy connection error for {target_date}: {e}")
         return [], []
 
     if res.status_code != 200:
-        print(f"No Bhavcopy available for {target_date} (HTTP {res.status_code}). Market holiday or file not published yet.")
+        print(f"No Bhavcopy available for {target_date} (Status: {res.status_code}). Likely exchange holiday or not published.")
         return [], []
 
     try:
@@ -66,12 +66,11 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
             with z.open(csv_name) as f:
                 df = pd.read_csv(f)
     except Exception as e:
-        print(f"Failed to decompress Bhavcopy archive: {e}")
+        print(f"Failed to decompress zip archive for {target_date}: {e}")
         return [], []
 
     df.columns = [c.strip() for c in df.columns]
 
-    # Handle standard UDiFF and fallback column schemas
     if "SctySrs" in df.columns:
         df = df[df['SctySrs'].isin(['EQ', 'BE'])].copy()
         sym_col, open_col, high_col, low_col, close_col, vol_col = (
@@ -119,8 +118,8 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
 
 def fetch_macro_indices_deltas(target_date: datetime.date):
     """
-    Fetches official closing values for NIFTY 50, NIFTY 500, and INDIA VIX
-    directly from NSE static archives with robust header discovery.
+    Fetches official closing numbers for NIFTY 50, NIFTY 500, and INDIA VIX
+    directly from NSE static archives with positional and name fallbacks.
     """
     if target_date.weekday() >= 5:
         return []
@@ -134,7 +133,7 @@ def fetch_macro_indices_deltas(target_date: datetime.date):
     ]
 
     for url in urls:
-        print(f"Requesting indices archive from: {url}")
+        print(f"Requesting indices file for {target_date} from: {url}")
         try:
             res = requests.get(url, headers=HEADERS, timeout=20)
             if res.status_code != 200:
@@ -143,7 +142,7 @@ def fetch_macro_indices_deltas(target_date: datetime.date):
             df = pd.read_csv(io.StringIO(res.text))
             df.columns = [c.strip() for c in df.columns]
 
-            # Dynamic column discovery with positional fallbacks
+            # Dynamic header resolution with positional fallbacks
             name_col = next((c for c in df.columns if "index" in c.lower() and "name" in c.lower()), df.columns[0])
             open_col = next((c for c in df.columns if "open" in c.lower()), df.columns[2] if len(df.columns) > 2 else None)
             high_col = next((c for c in df.columns if "high" in c.lower()), df.columns[3] if len(df.columns) > 3 else None)
@@ -169,17 +168,17 @@ def fetch_macro_indices_deltas(target_date: datetime.date):
                     })
 
             if len(indices_data) > 0:
-                print(f"Successfully extracted {len(indices_data)} indices from {url}")
+                print(f"Successfully extracted {len(indices_data)} indices for {target_date}")
                 return indices_data
 
         except Exception as e:
-            print(f"Error reading indices from {url}: {e}")
+            print(f"Error reading indices for {target_date} from {url}: {e}")
 
     print(f"Warning: No index candles could be fetched for {target_date}.")
     return []
 
 def fetch_corporate_action_alerts():
-    """Fetches upcoming corporate actions for cash stocks and tracked ETFs."""
+    """Fetches upcoming corporate actions for stocks and monitors special ETFs."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -215,21 +214,41 @@ def fetch_corporate_action_alerts():
     return alerts
 
 def main():
-    target_date = get_current_ist_date()
-    print(f"Executing sync for IST date: {target_date}")
-    
-    stock_deltas, etf_deltas = fetch_bhavcopy_deltas(target_date)
-    index_deltas = fetch_macro_indices_deltas(target_date)
-    all_macro_deltas = etf_deltas + index_deltas
+    today = get_current_ist_date()
+    print(f"Executing 7-day rolling sync starting from IST date: {today}")
+
+    all_stock_deltas = []
+    all_macro_deltas = []
+    active_dates_collected = set()
+
+    # Iterate over the last 7 calendar days (covers a full trading week)
+    for i in range(7):
+        target_date = today - datetime.timedelta(days=i)
+        if target_date.weekday() >= 5:  # Skip weekends
+            continue
+
+        stocks, etfs = fetch_bhavcopy_deltas(target_date)
+        indices = fetch_macro_indices_deltas(target_date)
+
+        if stocks or etfs or indices:
+            active_dates_collected.add(target_date.strftime("%Y-%m-%d"))
+
+        all_stock_deltas.extend(stocks)
+        all_macro_deltas.extend(etfs + indices)
 
     alerts = fetch_corporate_action_alerts()
 
+    start_date_str = (today - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
+    end_date_str = today.strftime("%Y-%m-%d")
+
     output_deltas = {
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "target_date": target_date.strftime("%Y-%m-%d"),
-        "record_count": len(stock_deltas),
+        "start_date": start_date_str,
+        "end_date": end_date_str,
+        "active_trading_days": sorted(list(active_dates_collected)),
+        "record_count": len(all_stock_deltas),
         "macro_count": len(all_macro_deltas),
-        "data": stock_deltas,
+        "data": all_stock_deltas,
         "macro_data": all_macro_deltas
     }
 
@@ -248,8 +267,11 @@ def main():
     with open(alerts_path, "w") as f:
         json.dump(output_alerts, f, indent=2)
 
-    print(f"Saved {len(stock_deltas)} stock candles to {deltas_path}")
-    print(f"Saved {len(all_macro_deltas)} macro candles (N50, N500, VIX, GOLDBEES, LIQUIDBEES) to {deltas_path}")
+    print(f"\n--- Sync Summary ---")
+    print(f"Date Range: {start_date_str} to {end_date_str}")
+    print(f"Trading Sessions Found: {len(active_dates_collected)}")
+    print(f"Saved {len(all_stock_deltas)} total stock candles across rolling window to {deltas_path}")
+    print(f"Saved {len(all_macro_deltas)} total macro candles to {deltas_path}")
     print(f"Saved {len(alerts)} corporate action alerts to {alerts_path}")
 
 if __name__ == "__main__":
