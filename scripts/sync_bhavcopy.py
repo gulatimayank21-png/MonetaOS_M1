@@ -11,12 +11,10 @@ os.makedirs(PUBLIC_DIR, exist_ok=True)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive"
+    "Accept": "*/*"
 }
 
-# Instruments to extract
+# Target Instruments
 SPECIAL_ETFS = {"GOLDBEES", "LIQUIDBEES"}
 TARGET_INDICES = {
     "NIFTY 50": "NIFTY 50",
@@ -25,6 +23,7 @@ TARGET_INDICES = {
 }
 
 def clean_num(val, default=0.0):
+    """Safely converts string numbers with commas to float."""
     try:
         clean = str(val).replace(",", "").strip()
         return float(clean) if clean not in ["-", ""] else default
@@ -39,11 +38,11 @@ def get_current_ist_date() -> datetime.date:
 
 def fetch_bhavcopy_deltas(target_date: datetime.date):
     """
-    Fetches the static UDiFF Bhavcopy and separates cash equities 
-    from whitelisted ETFs (GOLDBEES, LIQUIDBEES).
+    Fetches the daily static UDiFF Bhavcopy from NSE archives,
+    separating cash equities from whitelisted ETFs (GOLDBEES, LIQUIDBEES).
     """
     if target_date.weekday() >= 5:
-        print(f"{target_date} is a weekend. Market closed.")
+        print(f"{target_date} is a weekend. Cash market closed.")
         return [], []
 
     date_ymd = target_date.strftime("%Y%m%d")
@@ -51,17 +50,14 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
     url = f"https://nsearchives.nseindia.com/content/cm/{filename}"
     
     print(f"Requesting static Bhavcopy from: {url}")
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    
     try:
-        res = session.get(url, timeout=25)
+        res = requests.get(url, headers=HEADERS, timeout=25)
     except Exception as e:
-        print(f"Network connection error: {e}")
+        print(f"Bhavcopy network error: {e}")
         return [], []
 
     if res.status_code != 200:
-        print(f"No Bhavcopy available for {target_date} (Status: {res.status_code}). Likely exchange holiday or file not published yet.")
+        print(f"No Bhavcopy available for {target_date} (HTTP {res.status_code}). Market holiday or file not published yet.")
         return [], []
 
     try:
@@ -70,11 +66,12 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
             with z.open(csv_name) as f:
                 df = pd.read_csv(f)
     except Exception as e:
-        print(f"Failed to decompress zip archive: {e}")
+        print(f"Failed to decompress Bhavcopy archive: {e}")
         return [], []
 
     df.columns = [c.strip() for c in df.columns]
 
+    # Handle standard UDiFF and fallback column schemas
     if "SctySrs" in df.columns:
         df = df[df['SctySrs'].isin(['EQ', 'BE'])].copy()
         sym_col, open_col, high_col, low_col, close_col, vol_col = (
@@ -122,63 +119,71 @@ def fetch_bhavcopy_deltas(target_date: datetime.date):
 
 def fetch_macro_indices_deltas(target_date: datetime.date):
     """
-    Fetches official closing numbers for NIFTY 50, NIFTY 500, and INDIA VIX
-    directly from NSE archives.
+    Fetches official closing values for NIFTY 50, NIFTY 500, and INDIA VIX
+    directly from NSE static archives with robust header discovery.
     """
     if target_date.weekday() >= 5:
         return []
 
     date_dmy = target_date.strftime("%d%m%Y")
     trade_date_str = target_date.strftime("%Y-%m-%d")
-    url = f"https://archives.nseindia.com/content/indices/ind_close_all_{date_dmy}.csv"
+    
+    urls = [
+        f"https://nsearchives.nseindia.com/content/indices/ind_close_all_{date_dmy}.csv",
+        f"https://archives.nseindia.com/content/indices/ind_close_all_{date_dmy}.csv"
+    ]
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    for url in urls:
+        print(f"Requesting indices archive from: {url}")
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=20)
+            if res.status_code != 200:
+                continue
 
-    try:
-        res = session.get(url, timeout=20)
-        if res.status_code != 200:
-            print(f"No index file available for {target_date} (Status: {res.status_code}).")
-            return []
+            df = pd.read_csv(io.StringIO(res.text))
+            df.columns = [c.strip() for c in df.columns]
 
-        df = pd.read_csv(io.StringIO(res.text))
-        df.columns = [c.strip().lower() for c in df.columns]
+            # Dynamic column discovery with positional fallbacks
+            name_col = next((c for c in df.columns if "index" in c.lower() and "name" in c.lower()), df.columns[0])
+            open_col = next((c for c in df.columns if "open" in c.lower()), df.columns[2] if len(df.columns) > 2 else None)
+            high_col = next((c for c in df.columns if "high" in c.lower()), df.columns[3] if len(df.columns) > 3 else None)
+            low_col = next((c for c in df.columns if "low" in c.lower()), df.columns[4] if len(df.columns) > 4 else None)
+            close_col = next(
+                (c for c in df.columns if any(k in c.lower() for k in ["closing", "close", "index value"])), 
+                df.columns[5] if len(df.columns) > 5 else None
+            )
+            vol_col = next((c for c in df.columns if any(k in c.lower() for k in ["volume", "shares", "traded"])), None)
 
-        name_col = next((c for c in df.columns if "index name" in c), None)
-        open_col = next((c for c in df.columns if "open" in c), None)
-        high_col = next((c for c in df.columns if "high" in c), None)
-        low_col = next((c for c in df.columns if "low" in c), None)
-        close_col = next((c for c in df.columns if "close" in c), None)
-        vol_col = next((c for c in df.columns if "volume" in c or "shares" in c), None)
+            indices_data = []
+            for _, row in df.iterrows():
+                raw_name = str(row[name_col]).strip().upper()
+                if raw_name in TARGET_INDICES:
+                    indices_data.append({
+                        "index_name": TARGET_INDICES[raw_name],
+                        "trade_date": trade_date_str,
+                        "open": clean_num(row[open_col]) if open_col else 0.0,
+                        "high": clean_num(row[high_col]) if high_col else 0.0,
+                        "low": clean_num(row[low_col]) if low_col else 0.0,
+                        "close": clean_num(row[close_col]),
+                        "volume": int(clean_num(row[vol_col])) if vol_col else 0
+                    })
 
-        if not (name_col and close_col):
-            return []
+            if len(indices_data) > 0:
+                print(f"Successfully extracted {len(indices_data)} indices from {url}")
+                return indices_data
 
-        indices_data = []
-        for _, row in df.iterrows():
-            raw_name = str(row[name_col]).strip().upper()
-            if raw_name in TARGET_INDICES:
-                indices_data.append({
-                    "index_name": TARGET_INDICES[raw_name],
-                    "trade_date": trade_date_str,
-                    "open": clean_num(row[open_col]),
-                    "high": clean_num(row[high_col]),
-                    "low": clean_num(row[low_col]),
-                    "close": clean_num(row[close_col]),
-                    "volume": int(clean_num(row[vol_col])) if vol_col else 0
-                })
-        return indices_data
-    except Exception as e:
-        print(f"Warning: Could not fetch indices for {target_date}: {e}")
-        return []
+        except Exception as e:
+            print(f"Error reading indices from {url}: {e}")
+
+    print(f"Warning: No index candles could be fetched for {target_date}.")
+    return []
 
 def fetch_corporate_action_alerts():
-    """Fetches upcoming corporate actions for stocks and monitors special ETFs."""
+    """Fetches upcoming corporate actions for cash stocks and tracked ETFs."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-actions"
     })
     
@@ -204,9 +209,6 @@ def fetch_corporate_action_alerts():
                         "ca_broadcast_date": act.get("bcStartDate"),
                         "is_macro_instrument": sym in SPECIAL_ETFS
                     })
-            print(f"Successfully collected {len(alerts)} corporate action alerts from NSE.")
-        else:
-            print(f"Corporate actions endpoint returned HTTP {res.status_code}.")
     except Exception as e:
         print(f"Warning: Could not fetch corporate actions: {e}")
         
@@ -248,7 +250,7 @@ def main():
 
     print(f"Saved {len(stock_deltas)} stock candles to {deltas_path}")
     print(f"Saved {len(all_macro_deltas)} macro candles (N50, N500, VIX, GOLDBEES, LIQUIDBEES) to {deltas_path}")
-    print(f"Saved {len(alerts)} alerts to {alerts_path}")
+    print(f"Saved {len(alerts)} corporate action alerts to {alerts_path}")
 
 if __name__ == "__main__":
     main()
